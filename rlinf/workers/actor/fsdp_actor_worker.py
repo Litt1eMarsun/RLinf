@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import subprocess
 from functools import partial
 
 import numpy as np
@@ -67,6 +68,22 @@ from rlinf.utils.utils import (
 from rlinf.workers.rollout.utils import RankMapper
 
 
+def print_gpu_memory(rank, tag=""):
+    """打印当前 GPU 显存使用情况"""
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            allocated = torch.cuda.memory_allocated(i) / 1024**3
+            reserved = torch.cuda.memory_reserved(i) / 1024**3
+            max_allocated = torch.cuda.max_memory_allocated(i) / 1024**3
+            print(f"[{tag}] GPU {rank}: Allocated={allocated:.2f}GB, Reserved={reserved:.2f}GB, Max={max_allocated:.2f}GB")
+    
+
+    uuid = subprocess.check_output(
+        f"nvidia-smi -i {rank} --query-gpu=uuid --format=csv,noheader",
+        shell=True
+    ).decode().strip()
+    print(f"pid={os.getpid()},Local_rank{rank},phiscal_gpu_id{uuid[:8]}...")
+
 def process_nested_dict_for_adv(nested_dict, rollout_epoch):
     """
     original shape: [rollout_epoch x n_chunk_steps, bsz, num_action_chunks, ...]
@@ -85,9 +102,15 @@ def process_nested_dict_for_adv(nested_dict, rollout_epoch):
             ret_dict[key] = new_value
         elif isinstance(value, dict):
             ret_dict[key] = process_nested_dict_for_adv(value, rollout_epoch)
+        else: 
+            ret_dict[key] = value
     return ret_dict
 
 
+
+
+
+# 这里修改了下，增加了rollout ouput的处理，避免部分结果为空导致的失败
 def process_nested_dict_for_train(nested_dict, shuffle_id):
     ret_dict = {}
     for key, value in nested_dict.items():
@@ -97,10 +120,29 @@ def process_nested_dict_for_train(nested_dict, shuffle_id):
             raise NotImplementedError
         if value is None:
             ret_dict[key] = None
+            continue
         if isinstance(value, torch.Tensor):
-            ret_dict[key] = value.reshape(-1, *value.shape[2:])[shuffle_id]
+            if len(value.shape) > 2: #当三维tensor时，需要展平所有batch维度
+                reshaped = value.reshape(-1, *value.shape[2:])
+                if reshaped.shape[0] == 0:
+                    raise ValueError(f"Empty tensor after reshape for key '{key}'. Original shape: {value.shape}, after reshape: {reshaped.shape}. This might be caused by reward filtering removing all samples.")
+                try:
+                    ret_dict[key] = reshaped[shuffle_id]
+                except RuntimeError:
+                    print(f"key:{key},value:{value.shape},shuffle_id:{shuffle_id.shape},reshaped:{reshaped.shape}")
+                    raise RuntimeError(f"Error shuffling tensor for key '{key}'")
+            elif shuffle_id.shape[0] == value.shape[0]: # 非三维的时候，只要第一维是符合shuffle大小的batchsize，可以shuffle
+                try:
+                    ret_dict[key] = value[shuffle_id]
+                except RuntimeError:
+                    print(f"key:{key},value:{value.shape},shuffle_id:{shuffle_id.shape}")
+                    raise RuntimeError(f"Error shuffling tensor for key '{key}'")
+            else: # 如果是[1,1]这种非batch大小的，直接返回
+                ret_dict[key] = value
         elif isinstance(value, dict):
             ret_dict[key] = process_nested_dict_for_train(value, shuffle_id)
+        else:
+            ret_dict[key] = value
     return ret_dict
 
 
@@ -809,7 +851,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         self, rollout_batch: dict[str, torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         """
-        original shape: [rollout_epoch x n_chunk_steps, bsz, num_action_chunks, ...]
+        original sha pe: [rollout_epoch x n_chunk_steps, bsz, num_action_chunks, ...]
         target shape: [n_chunk_steps, rollout_epoch x bsz, num_action_chunks, ...]
         """
         rollout_epoch = self.cfg.algorithm.rollout_epoch
@@ -1048,6 +1090,446 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                         "loss_mask": loss_mask,
                         "loss_mask_sum": loss_mask_sum,
                         "max_episode_steps": self.cfg.env.train.max_episode_steps,
+                        "task_type": self.cfg.runner.task_type,
+                        "critic_warmup": self.optimizer_steps
+                        < self.critic_warmup_steps,
+                    }
+                    loss, metrics_data = policy_loss(**kwargs)
+
+                    entropy_loss = torch.tensor(0.0, device=torch.cuda.current_device())
+                    if (
+                        self.cfg.algorithm.entropy_bonus > 0
+                        and not kwargs["critic_warmup"]
+                    ):
+                        entropy = output_dict["entropy"]
+                        entropy = reshape_entropy(
+                            entropy,
+                            entropy_type=self.cfg.algorithm.entropy_type,
+                            action_dim=self.cfg.actor.model.get("action_dim", 7),
+                            batch_size=output_dict["logprobs"].shape[0],
+                        )
+                        entropy_loss = masked_mean(entropy, mask=loss_mask)
+                        loss -= self.cfg.algorithm.entropy_bonus * entropy_loss
+                    metrics_data["actor/entropy_loss"] = entropy_loss.detach().item()
+
+                    loss /= self.gradient_accumulation
+                    with backward_ctx:
+                        self.grad_scaler.scale(loss).backward()
+
+                    metrics_data["actor/total_loss"] = loss.detach().item()
+                    append_to_dict(metrics, metrics_data)
+
+                torch.cuda.empty_cache()
+
+                grad_norm, lr_list = self.optimizer_step()
+                data = {
+                    "actor/grad_norm": grad_norm,
+                    "actor/lr": lr_list[0],
+                }
+                if len(lr_list) > 1:
+                    data["critic/lr"] = lr_list[1]
+                append_to_dict(metrics, data)
+        # put LR scheduler step here
+        self.lr_scheduler.step()
+        self.optimizer.zero_grad()
+        clear_memory()
+        mean_metric_dict = {key: np.mean(value) for key, value in metrics.items()}
+        mean_metric_dict = all_reduce_dict(
+            mean_metric_dict, op=torch.distributed.ReduceOp.AVG
+        )
+
+        return mean_metric_dict
+
+    def set_global_step(self, global_step) -> None:
+        """
+        Set the global step for the model, if needed.
+        """
+        if hasattr(self.model, "set_global_step"):
+            self.model.set_global_step(global_step)
+
+
+class AVFSDPActor(FSDPModelManager, Worker):
+    """
+    FSDP Actor for Autonomous Vehicle (AV) tasks.
+    
+    Similar to EmbodiedFSDPActor but designed specifically for AV tasks:
+    - Uses get_model() to load custom models (e.g., AlpamayoR1ForRL)
+    - Supports trajectory tokenizers and multi-modal inputs
+    - Works with AVRunner (no env worker needed)
+    - Data comes from offline datasets (AlpamayoAVDataset) via AVWorker
+    """
+    
+    def __init__(self, cfg: DictConfig, placement: "ModelParallelComponentPlacement" = None):
+        Worker.__init__(self)
+        super().__init__(cfg.actor, self._world_size, self._rank)
+        self.cfg = cfg
+        # Note: No _env_group_name needed for AV tasks (no env worker)
+        self._rollout_group_name = cfg.rollout.group_name
+        # Use provided placement or create new one
+        self._component_placement = placement if placement is not None else HybridComponentPlacement(cfg, Cluster())
+
+        # stage_num: default to 2, use for pipeline rollout process
+        self.stage_num = cfg.rollout.get("pipeline_stage_num", 2)
+
+        self.enable_offload = self.cfg.actor.get("enable_offload", False)
+        self.entropy_op_type = self.cfg.algorithm.get("entropy_op_type", "torch")
+
+        # Sync weight comm options
+        max_ctas = cfg.rollout.get("sync_weight_nccl_max_ctas", None)
+        min_ctas = cfg.rollout.get("sync_weight_nccl_min_ctas", None)
+        self._sync_weight_comm_options = CollectiveGroupOptions(
+            accel_max_ctas=max_ctas, accel_min_ctas=min_ctas
+        )
+
+    def _setup_rollout_weight_dst_ranks(self) -> None:
+        """
+        Setup destination ranks for weight communication.
+        It can support any topology between actor and rollout workers.
+        Assuming there are M actor ranks and N rollout ranks, each actor rank
+        will send weights to most ceil(N/M) rollout ranks according to the modulo rule.
+        """
+        rollout_world_size = self._component_placement.get_world_size("rollout")
+        actor_world_size = self._world_size
+        rank = self._rank
+        self._weight_dst_rank_in_rollout = []
+        rollout_ranks_per_actor = (
+            rollout_world_size + actor_world_size - 1
+        ) // actor_world_size
+        for i in range(rollout_ranks_per_actor):
+            if i * actor_world_size + rank < rollout_world_size:
+                self._weight_dst_rank_in_rollout.append(i * actor_world_size + rank)
+
+    def init_worker(self) -> None:
+        """
+        Initialize the actor worker. build the model and use corresponding training backend,
+        if needed, offload model parameters and optimizer states to CPU.
+        """
+        self.setup_model_and_optimizer()
+
+        if self.enable_offload:
+            self.offload_param_and_grad()
+            self.offload_optimizer()
+        self._setup_rollout_weight_dst_ranks()
+
+    def model_provider_func(self) -> nn.Module:
+        model = get_model(self.cfg.actor.model)
+        if model is None:
+            model = super().model_provider_func()
+
+        if self.cfg.runner.get("ckpt_path", None):
+            model_dict = torch.load(self.cfg.runner.ckpt_path)
+            model.load_state_dict(model_dict)
+
+        return model
+
+    def sync_model_to_rollout(self) -> None:
+        """
+        Sync the model's full state dict to the rollout worker.
+        """
+        if self.enable_offload and not self.is_optimizer_offloaded:
+            self.offload_optimizer()
+
+        if self.enable_offload and self.is_weight_offloaded:
+            self.load_param_and_grad(self.device)
+
+        state_dict = self.get_model_state_dict(cpu_offload=False, full_state_dict=True)
+        for rank in self._weight_dst_rank_in_rollout:
+            self.send(
+                state_dict,
+                self._rollout_group_name,
+                rank,
+                async_op=True,
+                options=self._sync_weight_comm_options,
+            )
+        if self.enable_offload and not self.is_weight_offloaded:
+            self.offload_param_and_grad()
+
+    def del_reshard_state_dict(self) -> None:
+        """Clean up state dict after syncing weights to rollout."""
+        if hasattr(self, "rollout_state_dict"):
+            del self.rollout_state_dict
+        clear_memory(sync=False)
+
+    async def recv_rollout_trajectories(self, input_channel: Channel) -> None:
+        """
+        Receive rollout trajectories from rollout workers.
+
+        Args:
+            input_channel: The input channel to read from.
+        """
+        send_num = self._component_placement.get_world_size("rollout") * self.stage_num
+        recv_num = self._component_placement.get_world_size("actor")
+        split_num = compute_split_num(send_num, recv_num)
+
+        recv_list = []
+        for _ in range(split_num):
+            trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
+            recv_list.append(trajectory)
+
+        self.rollout_batch = convert_trajectories_to_batch(recv_list)
+
+        
+        self.rollout_batch = self._process_received_rollout_batch(self.rollout_batch)
+        #import pdb; pdb.set_trace() # 在这里查看rollout_batch的key及其对应的value是否全（tokenize_input缺这个key
+
+    def _process_received_rollout_batch(
+        self, rollout_batch: dict[str, torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """
+        Process received rollout batch.
+        Note: For AV tasks, we don't have env.train config, so skip termination-related processing.
+        
+        original shape: [rollout_epoch x n_chunk_steps, bsz, num_action_chunks, ...]
+        target shape: [n_chunk_steps, rollout_epoch x bsz, num_action_chunks, ...]
+        """
+        rollout_epoch = self.cfg.algorithm.rollout_epoch
+        print_gpu_memory(self._rank,tag = "before reshape rollout batch")
+        rollout_batch = process_nested_dict_for_adv(rollout_batch, rollout_epoch)
+
+        # Skip termination processing for AV tasks (no env worker)
+        # AV tasks use embodied-style processing but without termination handling
+        # The loss_mask will be created by preprocess_embodied_advantages_inputs if needed
+
+        # filter data by rewards
+        if self.cfg.algorithm.get("filter_rewards", False):
+            rewards = rollout_batch[
+                "rewards"
+            ]  # [n_chunk_step, batch, num_action_chunks]
+            if rollout_batch.get("loss_mask", None) is not None:
+                rewards = rewards * rollout_batch["loss_mask"]
+            n_chunk_step, batch_size, num_action_chunks = rewards.shape
+
+            group_size = self.cfg.algorithm.group_size
+            assert batch_size % group_size == 0, (
+                f"batch {batch_size} not divisible by group_size {group_size}"
+            )
+            n_prompts = batch_size // group_size
+
+            # calculate rewards by prompt
+            rewards = rewards.transpose(
+                0, 1
+            )  # [batch, n_chunk_step, num_action_chunks]
+            rewards = rewards.reshape(rewards.shape[0], -1)  # [batch, n_step]
+            reward_matrix = rewards.reshape(
+                n_prompts, group_size, rewards.shape[-1]
+            )  # [n_prompts, group_size, n_step]
+            reward_matrix = reward_matrix.sum(dim=-1)  # [n_prompts, group_size]
+            mean_reward_in_group = reward_matrix.mean(dim=1)  # [n_prompts]
+
+            # mask
+            reward_filter_mask = (
+                mean_reward_in_group >= self.cfg.algorithm.rewards_lower_bound
+            ) & (
+                mean_reward_in_group <= self.cfg.algorithm.rewards_upper_bound
+            )  # [n_prompts]
+
+            # extend mask dimension
+            reward_filter_mask = reward_filter_mask.repeat_interleave(
+                group_size
+            )  # [batch]
+            reward_filter_mask = (
+                reward_filter_mask.unsqueeze(0).expand(n_chunk_step, -1).unsqueeze(-1)
+            )  # [n_chunk_step, batch, 1]
+
+            # update loss_mask
+            if rollout_batch.get("loss_mask", None) is not None:
+                rollout_batch["loss_mask"] = (
+                    reward_filter_mask & rollout_batch["loss_mask"]
+                )
+            else:
+                rollout_batch["loss_mask"] = reward_filter_mask
+
+        return rollout_batch
+
+    def compute_advantages_and_returns(self) -> dict[str, torch.Tensor]:
+        """
+        Compute the advantages and returns.
+        """
+        kwargs = {
+            "task_type": self.cfg.runner.task_type,
+            "adv_type": self.cfg.algorithm.adv_type,
+            "rewards": self.rollout_batch["rewards"],
+            "dones": self.rollout_batch.get("dones", None),
+            "values": self.rollout_batch.get("prev_values", None),
+            "gamma": self.cfg.algorithm.get("gamma", 1),
+            "gae_lambda": self.cfg.algorithm.get("gae_lambda", 1),
+            "group_size": self.cfg.algorithm.get("group_size", 8),
+            "reward_type": self.cfg.algorithm.reward_type,
+            "loss_mask": self.rollout_batch.get("loss_mask", None),
+            "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
+        }
+
+        advantages_and_returns = calculate_adv_and_returns(**kwargs)
+
+        self.rollout_batch.update(advantages_and_returns)
+        if kwargs["loss_mask"] is not None:
+            self.rollout_batch.update({"loss_mask": kwargs["loss_mask"]})
+        if kwargs["loss_mask_sum"] is not None:
+            self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
+
+        rollout_metrics = compute_rollout_metrics(self.rollout_batch)
+        # import ipdb; ipdb.set_trace() # 在这里查看rollout_batch的key及其对应的value是否全（tokenize_input缺这个key
+        return rollout_metrics
+
+    def run_training(self) -> None:
+        """
+        Run the training process using the received rollout batch.
+        """
+        with self.worker_timer():
+            return self.run_training_impl()
+
+    def run_training_impl(self):
+        print_gpu_memory(self._rank, tag = "start")
+        print(f"is_weight_offload:{self.is_weight_offloaded}")
+        print(f"is_oprimizer_offload:{self.is_optimizer_offloaded}")
+        if self.is_weight_offloaded:
+            self.load_param_and_grad(self.device)
+        if self.is_optimizer_offloaded:
+            self.load_optimizer(self.device)
+
+        print_gpu_memory(self._rank, tag = "load_done")
+        print("load model done")
+        self.model.train()
+        rollout_size = (
+            self.rollout_batch["prev_logprobs"].shape[0]
+            * self.rollout_batch["prev_logprobs"].shape[1]
+        )
+        g = torch.Generator()
+        g.manual_seed(self.cfg.actor.seed + self._rank)
+        shuffle_id = torch.randperm(rollout_size, generator=g)
+
+        print_gpu_memory(self._rank, tag = "before process dict for train(shuffle)")
+        with torch.no_grad():
+            self.rollout_batch = process_nested_dict_for_train(
+                self.rollout_batch, shuffle_id
+            )
+
+        assert (
+            self.cfg.actor.global_batch_size
+            % (self.cfg.actor.micro_batch_size * self._world_size)
+            == 0
+        ), "global_batch_size is not divisible by micro_batch_size * world_size"
+
+        self.gradient_accumulation = (
+            self.cfg.actor.global_batch_size
+            // self.cfg.actor.micro_batch_size
+            // self._world_size
+        )
+
+        # Split to make minibatch iterator for updating the actor
+        # See PPO paper for details. https://arxiv.org/abs/1707.06347
+        rollout_size = self.rollout_batch["prev_logprobs"].size(0)
+        batch_size_per_rank = self.cfg.actor.global_batch_size // self._world_size
+        assert rollout_size % batch_size_per_rank == 0, (
+            f"{rollout_size} is not divisible by {batch_size_per_rank}"
+        )
+        metrics = {}
+        update_epoch = self.cfg.algorithm.get("update_epoch", 1)
+        for _ in range(update_epoch):
+            rollout_dataloader_iter = split_dict_to_chunk(
+                self.rollout_batch,
+                rollout_size // batch_size_per_rank,
+            )
+            for train_global_batch in rollout_dataloader_iter:
+                # split batch into micro_batches
+                train_global_batch_size = train_global_batch["prev_logprobs"].shape[0]
+                assert (
+                    train_global_batch_size
+                    == self.cfg.actor.global_batch_size
+                    // torch.distributed.get_world_size()
+                )
+                assert train_global_batch_size % self.cfg.actor.micro_batch_size == 0, (
+                    f"{train_global_batch_size=}, {self.cfg.actor.micro_batch_size}"
+                )
+
+                train_micro_batch = split_dict_to_chunk(
+                    train_global_batch,
+                    train_global_batch_size // self.cfg.actor.micro_batch_size,
+                )
+
+
+                self.optimizer.zero_grad()
+                for idx, batch in enumerate(train_micro_batch):
+                    batch = put_tensor_device(
+                        batch, f"cuda:{int(os.environ['LOCAL_RANK'])}"
+                    )
+                    print_gpu_memory(self._rank, tag = "load data 2 gpu")
+                    backward_ctx = self.before_micro_batch(
+                        self.model,
+                        is_last_micro_batch=(idx + 1) == self.gradient_accumulation,
+                    )
+                    advantages = batch["advantages"]
+                    prev_logprobs = batch["prev_logprobs"]
+                    returns = batch.get("returns", None)
+                    prev_values = batch.get("prev_values", None)
+                    loss_mask = batch.get("loss_mask", None)
+                    loss_mask_sum = batch.get("loss_mask_sum", None)
+
+                    forward_inputs = batch.get("forward_inputs", None)
+
+                    kwargs = {}
+                    if SupportedModel(self.cfg.actor.model.model_type) in [
+                        SupportedModel.OPENVLA,
+                        SupportedModel.OPENVLA_OFT,
+                    ]:
+                        kwargs["temperature"] = (
+                            self.cfg.algorithm.sampling_params.temperature_train
+                        )
+                        kwargs["top_k"] = self.cfg.algorithm.sampling_params.top_k
+                    elif (
+                        SupportedModel(self.cfg.actor.model.model_type)
+                        == SupportedModel.GR00T
+                    ):
+                        kwargs["prev_logprobs"] = prev_logprobs
+                    elif (
+                        SupportedModel(self.cfg.actor.model.model_type)
+                        == SupportedModel.ALPAMAYO
+                    ):
+                        # Add Alpamayo-specific sampling params if needed
+                        pass
+
+                    compute_values = (
+                        True if self.cfg.algorithm.adv_type == "gae" else False
+                    )
+
+                    print("prepare done")
+                    with self.amp_context:
+                        output_dict = self.model(
+                            forward_inputs=forward_inputs,
+                            compute_logprobs=True,
+                            compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
+                            compute_values=compute_values,
+                            use_cache=False,
+                            **kwargs,
+                        )
+
+                    if (
+                        SupportedModel(self.cfg.actor.model.model_type)
+                        == SupportedModel.GR00T
+                    ):
+                        prev_logprobs = output_dict["prev_logprobs"]
+
+                    # For AV tasks, use a large default max_episode_steps since we don't have env config
+                    max_episode_steps = self.cfg.get("env", {}).get("train", {}).get("max_episode_steps", 1000)
+                    
+                    kwargs = {
+                        "loss_type": self.cfg.algorithm.loss_type,
+                        "logprob_type": self.cfg.algorithm.logprob_type,
+                        "reward_type": self.cfg.algorithm.reward_type,
+                        "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
+                        "logprobs": output_dict["logprobs"],
+                        "values": output_dict.get("values", None),
+                        "old_logprobs": prev_logprobs,
+                        "advantages": advantages,
+                        "returns": returns,
+                        "prev_values": prev_values,
+                        "clip_ratio_high": self.cfg.algorithm.clip_ratio_high,
+                        "clip_ratio_low": self.cfg.algorithm.clip_ratio_low,
+                        "value_clip": self.cfg.algorithm.get("value_clip", None),
+                        "huber_delta": self.cfg.algorithm.get("huber_delta", None),
+                        "loss_mask": loss_mask,
+                        "loss_mask_sum": loss_mask_sum,
+                        "max_episode_steps": max_episode_steps,
                         "task_type": self.cfg.runner.task_type,
                         "critic_warmup": self.optimizer_steps
                         < self.critic_warmup_steps,

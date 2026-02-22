@@ -2,7 +2,7 @@
 name = "RLinf"
 version = "0.2.0"
 readme = {file = "README.md", content-type = "text/markdown"}
-requires-python = ">=3.10,<=3.11.14"
+requires-python = ">=3.10,<=3.12.12"
 keywords = [
     "reinforcement-learning",
     "embodied-intelligence",
@@ -17,7 +17,7 @@ classifiers = [
     "Environment :: GPU :: NVIDIA CUDA :: 12 :: 12.4",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
 ]
 
 dependencies = [
@@ -154,3 +154,14 @@ skip-magic-trailing-comma = false
 line-ending = "auto"
 docstring-code-format = true
 docstring-code-line-length = "dynamic"
+
+
+[build-system]
+requires = ["setuptools>=69.5.1", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["rlinf"]
+
+[tool.setuptools.package-data]
+rlinf = ["**/*.yaml", "**/*.yml", "**/*.json"]

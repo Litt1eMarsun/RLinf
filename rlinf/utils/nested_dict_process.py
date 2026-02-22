@@ -50,10 +50,18 @@ def split_dict_to_chunk(data: dict, split_size, dim=0):
             split_vs = [None for _ in range(split_size)]
         elif isinstance(value, dict):
             split_vs = split_dict_to_chunk(value, split_size, dim)
+        elif isinstance(value, list):
+            # 标量列表（如 prompt_length），对所有 chunk 广播同一个值
+            split_vs = [value] * split_size
         else:
             raise ValueError(f"{key=}, {type(value)} is not supported.")
+        
         for split_id in range(split_size):
-            splited_list[split_id][key] = split_vs[split_id]
+            try:
+                splited_list[split_id][key] = split_vs[split_id]
+            except IndexError:
+                print(f"key:{key}, value shape:{value.shape if isinstance(value, torch.Tensor) else type(value)}, split_vs len:{len(split_vs)}, split_id:{split_id}, split_size:{split_size}")
+                raise RuntimeError(f"Error splitting tensor for key '{key}'")
     return splited_list
 
 

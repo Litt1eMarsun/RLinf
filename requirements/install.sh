@@ -7,7 +7,7 @@ TARGET=""
 MODEL=""
 ENV_NAME=""
 VENV_DIR=".venv"
-PYTHON_VERSION="3.11.14"
+PYTHON_VERSION="3.12"
 TEST_BUILD=${TEST_BUILD:-0}
 # Absolute path to this script (resolves symlinks)
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"

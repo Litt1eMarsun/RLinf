@@ -375,13 +375,31 @@ def convert_trajectories_to_batch(
             all_keys.update(traj.forward_inputs.keys())
         batch["forward_inputs"] = {}
         for key in all_keys:
-            tensors = [
+            values = [
                 traj.forward_inputs[key]
                 for traj in trajectories
                 if key in traj.forward_inputs
             ]
-            if tensors:
-                batch["forward_inputs"][key] = torch.cat(tensors, dim=1)
+            if not values:
+                continue
+            first = values[0]
+            if isinstance(first, torch.Tensor):
+                batch["forward_inputs"][key] = torch.cat(values, dim=1)
+            # elif isinstance(first, (int, float)):
+                # 标量（如 prompt_length）stack 成 [1, N]，与 batch 维度一致
+            #     device = None
+            #     for v in trajectories[0].forward_inputs.values():
+            #         if isinstance(v, torch.Tensor):
+            #             device = v.device
+            #             break
+            #     batch["forward_inputs"][key] = torch.tensor(
+            #         values,
+            #         dtype=torch.long if isinstance(first, int) else torch.float,
+            #         device=device,
+            #     ).unsqueeze(0)
+            else:
+                # dict 等非 Tensor 类型：保持为 list，下游按需取
+                batch["forward_inputs"][key] = values
 
     # -------- tensor fields --------
     for field_name in trajectories[0].__dataclass_fields__.keys():

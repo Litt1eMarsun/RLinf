@@ -82,12 +82,13 @@ def policy_loss(**kwargs) -> tuple[torch.Tensor, dict]:
     loss_fn = get_policy_loss(loss_type)
 
     task_type = kwargs["task_type"]
-    if task_type == "embodied":
+    if task_type in ["embodied", "av"]:
+        # AV tasks use the same Trajectory data format as embodied tasks
         kwargs = preprocess_loss_inputs(**kwargs)
 
     loss, metrics_data = loss_fn(**kwargs)
 
-    if task_type == "embodied":
+    if task_type in ["embodied", "av"]:
         metrics_data = postprocess_loss_metric(metrics_data)
     return loss, metrics_data
 
@@ -102,7 +103,8 @@ def calculate_adv_and_returns(**kwargs) -> tuple[torch.Tensor, Optional[torch.Te
     fn = get_adv_and_returns(adv_type)
 
     task_type = kwargs["task_type"]
-    if task_type == "embodied":
+    if task_type in ["embodied", "av"]:
+        # AV tasks use the same data format as embodied tasks (Trajectory-based)
         kwargs = preprocess_embodied_advantages_inputs(**kwargs)
         if adv_type != "gae":
             kwargs = calculate_scores(**kwargs)

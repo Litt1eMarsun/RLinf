@@ -47,6 +47,7 @@ class SupportedModel(Enum):
     QWEN2_5_VL = ("qwen2.5_vl", "reasoning")
     QWEN3 = ("qwen3", "reasoning")
     QWEN3_MOE = ("qwen3_moe", "reasoning")
+    ALPAMAYO = ("alpamayo", "reasoning")
 
     # Embodied models
     OPENVLA = ("openvla", "embodied")
@@ -57,6 +58,7 @@ class SupportedModel(Enum):
     CNN_POLICY = ("cnn_policy", "embodied")
     FLOW_POLICY = ("flow_policy", "embodied")
     CMA_POLICY = ("cma", "embodied")
+
 
     def __new__(cls, value, category):
         obj = object.__new__(cls)
@@ -82,6 +84,7 @@ SUPPORTED_TASK_TYPE = [
     "reasoning_eval",
     "coding_online_rl",
     "sft",
+    "av",  # Autonomous Vehicle tasks
 ]
 SUPPORTED_TRAINING_BACKENDS = ["megatron", "fsdp"]
 __all__ = ["build_config"]
@@ -686,6 +689,32 @@ def validate_megatron_cfg(cfg: DictConfig) -> DictConfig:
     return cfg
 
 
+def validate_av_cfg(cfg):
+    """
+    Validate configuration for Autonomous Vehicle (AV) tasks.
+    Similar to embodied tasks but without env worker requirements.
+    """
+    # AV tasks use alpamayo or similar models
+    # Skip model category check since alpamayo is categorized as "reasoning"
+    # but is actually a VLA model suitable for AV tasks
+    
+    # Check that actor loss type is compatible
+    if cfg.algorithm.loss_type == "actor_critic":
+        add_value_head = cfg.actor.model.get("add_value_head", False)
+        assert add_value_head, (
+            f"When using PPO algorithm (algorithm.loss_type='actor_critic'), "
+            f"actor.model.add_value_head must be True. "
+            f"Current value: {add_value_head}"
+        )
+    
+    # Verify pipeline_stage_num is set
+    assert cfg.rollout.get("pipeline_stage_num") is not None, (
+        "rollout.pipeline_stage_num must be set for AV tasks"
+    )
+    
+    return cfg
+
+
 def validate_embodied_cfg(cfg):
     assert get_supported_model(cfg.actor.model.model_type).category == "embodied", (
         f"Model type: '{cfg.actor.model.model_type}' is not an embodied model. "
@@ -852,7 +881,27 @@ def validate_reasoning_cfg(cfg: DictConfig) -> DictConfig:
             or cfg.algorithm.get("importance_sampling_fix", False)
         )
 
-        cfg.rollout = validate_rollout_cfg(cfg.rollout, cfg.algorithm)
+        # Only validate rollout config for standard backends (vllm/sglang)
+        # Skip validation for custom backends (e.g., "av" for autonomous vehicle tasks)
+        generation_backend = cfg.rollout.get("generation_backend", None)
+        rollout_backend = cfg.rollout.get("rollout_backend", None)
+        
+        # Check if using custom backend
+        is_custom_backend = (
+            generation_backend and generation_backend not in ["vllm", "sglang"]
+        ) or (
+            rollout_backend and rollout_backend not in ["vllm", "sglang"]
+        )
+        
+        if not is_custom_backend:
+            # Standard reasoning task with vllm/sglang
+            cfg.rollout = validate_rollout_cfg(cfg.rollout, cfg.algorithm)
+        else:
+            # Custom rollout backend (e.g., AVWorker, custom HuggingFace worker)
+            # Only validate basic required fields
+            assert cfg.rollout.model.model_path is not None, (
+                "rollout.model.model_path must be specified for rollout."
+            )
     return cfg
 
 
@@ -929,6 +978,8 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
     )
     if cfg.runner.task_type == "embodied":
         cfg = validate_embodied_cfg(cfg)
+    elif cfg.runner.task_type == "av":
+        cfg = validate_av_cfg(cfg)
     elif cfg.runner.task_type == "reasoning":
         cfg = validate_reasoning_cfg(cfg)
     elif cfg.runner.task_type == "coding_online_rl":

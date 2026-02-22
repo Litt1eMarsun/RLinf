@@ -136,7 +136,8 @@ def calculate_scores(
     dones: torch.Tensor,
     **kwargs,
 ) -> dict:
-    scores = torch.zeros(kwargs["batch_size"])
+    scores = torch.zeros(kwargs["batch_size"], device=rewards.device, dtype=rewards.dtype)
+    dones = dones.to(rewards.device)
     for step in reversed(range(kwargs["n_steps"])):
         scores = scores * ~dones[step + 1]
         scores += rewards[step]

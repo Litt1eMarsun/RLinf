@@ -16,7 +16,8 @@ import logging
 import os
 import typing
 from typing import Optional, Union
-
+import time
+from contextlib import contextmanager
 import pandas as pd
 import torch
 from omegaconf.dictconfig import DictConfig
@@ -36,19 +37,29 @@ from rlinf.utils.timers import Timer
 if typing.TYPE_CHECKING:
     from rlinf.scheduler.dynamic_scheduler.scheduler_worker import SchedulerWorker
     from rlinf.utils.placement import ModelParallelComponentPlacement
-    from rlinf.workers.actor.fsdp_actor_worker import FSDPActor
+    from rlinf.workers.actor.fsdp_actor_worker import FSDPActor, AVFSDPActor
     from rlinf.workers.actor.megatron_actor_worker import MegatronActor
     from rlinf.workers.inference.fsdp_inference_worker import FSDPInference
     from rlinf.workers.inference.megatron_inference_worker import MegatronInference
     from rlinf.workers.reward.reward_worker import RewardWorker
     from rlinf.workers.rollout.sglang.sglang_worker import SGLangWorker
     from rlinf.workers.rollout.vllm.vllm_worker import VLLMWorker
+    from rlinf.workers.rollout.hf.av_worker import AVWorker
 
 logging.getLogger().setLevel(logging.INFO)
 
+@contextmanager
+def timer(name):
+    start_time = time.time()
+    print(f"Starting {name}...")
+    yield
+    end_time = time.time()
+    print(f"{name} took {end_time - start_time:.2f} seconds")
 
-class ReasoningRunner:
-    """Runner for reasoning task RL training."""
+
+
+class AVRunner:
+    """Runner for autonomous vehicle task RL training."""
 
     def __init__(
         self,
@@ -56,9 +67,9 @@ class ReasoningRunner:
         placement: "ModelParallelComponentPlacement",
         train_dataset: Dataset,
         val_dataset: Dataset,
-        rollout: Union["SGLangWorker", "VLLMWorker"],
+        rollout: Union["SGLangWorker", "VLLMWorker", "AVWorker"],
         inference: Optional[Union["FSDPInference", "MegatronInference"]],
-        actor: Union["FSDPActor", "MegatronActor"],
+        actor: Union["FSDPActor", "AVFSDPActor", "MegatronActor"],
         reward: Optional["RewardWorker"],
         scheduler: "SchedulerWorker" = None,
     ):
@@ -83,6 +94,7 @@ class ReasoningRunner:
         # Data channels
         self.dataloader_channel = Channel.create("DataLoader")
         self.rollout_channel = Channel.create("Rollout")
+        self.actor_channel = Channel.create("Actor")
         # Create a local channel (i.e., a channel that is different in every process)
         # if inference is not a dedicated worker
         self.inference_channel = Channel.create("Inference")
@@ -120,7 +132,8 @@ class ReasoningRunner:
         """
         self.train_dataset, self.val_dataset = train_dataset, val_dataset
         if collate_fn is None:
-            from rlinf.data.datasets import collate_fn
+            # Use AV-specific collate_fn for autonomous vehicle datasets
+            from rlinf.data.datasets import av_collate_fn as collate_fn
 
         # Use a sampler to facilitate checkpoint resumption.
         # If shuffling is enabled in the data configuration, create a random sampler.
@@ -327,32 +340,35 @@ class ReasoningRunner:
     def epoch(self):
         return self.global_steps // self.num_steps_per_epoch
 
-    def _put_batch(self, batch: dict[str, torch.Tensor]):
-        prompt_ids = batch["prompt"].tolist() # 这里batch数据处理需要对齐下AV数据集
-        lengths = batch["length"].tolist()
-        answers = batch["answer"]
-        image_data = batch["image_data"]
-        multi_modal_inputs = batch["multi_modal_inputs"]
-        prompt_ids = [ids[-pmp_len:] for ids, pmp_len in zip(prompt_ids, lengths)]
-        rollout_dp_size = self.component_placement.rollout_dp_size
-
-        for input_ids, answers, image_data, multi_modal_inputs in zip(
-            split_list(prompt_ids, rollout_dp_size, enforce_divisible_batch=False),
-            split_list(answers, rollout_dp_size, enforce_divisible_batch=False),
-            split_list(image_data, rollout_dp_size, enforce_divisible_batch=False),
-            split_list(
-                multi_modal_inputs, rollout_dp_size, enforce_divisible_batch=False
-            ),
-        ):
-            request = RolloutRequest(
-                n=self.cfg.algorithm.group_size,
-                input_ids=input_ids,
-                answers=answers,
-                image_data=image_data,
-                multi_modal_inputs=multi_modal_inputs,
-            )
-            self.dataloader_channel.put(request, async_op=True)
-
+    def _put_batch(self, batch):
+        """
+        Put batch data into the dataloader channel for rollout workers.
+        
+        For AV tasks, batch is a list of dicts from AlpamayoAVDataset.
+        Each dict contains multi-camera images and trajectory data.
+        """
+        # For AV tasks, batch is already a list of sample dicts
+        if isinstance(batch, list) and len(batch) > 0 and isinstance(batch[0], dict):
+            # AV data format: list of dicts
+            rollout_dp_size = self.component_placement.rollout_dp_size
+            
+            logging.info(f"_put_batch: batch length={len(batch)}, rollout_dp_size={rollout_dp_size}")
+            
+            # Split batch across rollout workers
+            batch_chunks = split_list(batch, rollout_dp_size, enforce_divisible_batch=False)
+            ## print batch chunks的形状及字典中key和对应的value（一个就行
+            
+            for idx, batch_chunk in enumerate(batch_chunks):
+                logging.info(f"_put_batch: sending chunk {idx} with {len(batch_chunk)} samples to channel")
+                request = RolloutRequest(
+                    n=self.cfg.algorithm.group_size,
+                    input_ids=[],  # Not used for AV tasks
+                    answers=[],  # Not used for AV tasks  
+                    image_data=[],  # Not used for AV tasks
+                    multi_modal_inputs=batch_chunk,  # AV data samples
+                )
+                self.dataloader_channel.put(request, async_op=True)
+      
     def _sync_weights(self):
         if self.has_dedicated_inference:
             self.actor.sync_model_to_inference()
@@ -377,98 +393,91 @@ class ReasoningRunner:
 
         self.run_timer.start_time()
         for _ in epoch_iter:
-            for batch in self.train_dataloader:
-                with self.timer("step"):
-                    with self.timer("prepare_data"):
+            with timer("epoch"): # 缺少手动broket time的机制
+                dataloader_iter = iter(self.train_dataloader)
+                for _ in range(len(self.train_dataloader)):
+                    #with self.timer("step"):
+                    with timer("read_batch"):
+                        batch = next(dataloader_iter)
+                        # with self.timer("prepare_data"):
+
+                    with timer("put_batch"):    
                         self._put_batch(batch)# 这里batch数据处理需要对齐下AV数据集
 
-                    with self.timer("sync_weights"):
-                        self._sync_weights()
-
-                    if self.scheduler is not None:
-                        scheduler_handle = self.scheduler.schedule()
-
-                    # Rollout
-                    rollout_handle: Handle = self.rollout.rollout(
-                        input_channel=self.dataloader_channel,
-                        output_channel=self.rollout_channel,
-                    )
-
-                    # Rewards
-                    reward_handle: Handle = self.reward.compute_rewards(
-                        input_channel=self.rollout_channel,
-                        output_channel=self.reward_channel,
-                    )
-
-                    if self.recompute_logprobs:
-                        # Inference prev/ref logprobs
-                        infer_handle: Handle = self.inference.run_inference(
-                            input_channel=self.reward_channel,
-                            output_channel=self.inference_channel,
-                            compute_ref_logprobs=self.compute_ref_logprobs,
+                    with timer("sync_batch"):
+                        #with self.timer("sync_weights"):
+                            self._sync_weights()
+                    
+                    with timer("schedule"):
+                        if self.scheduler is not None:
+                            scheduler_handle = self.scheduler.schedule()
+                    with timer("rollout"):
+                        # Rollout - AVWorker generates trajectories with rewards
+                        rollout_handle: Handle = self.rollout.rollout(
+                            input_channel=self.dataloader_channel,
+                            output_channel=self.actor_channel,
                         )
-                        inference_channel = self.inference_channel
-                    else:
-                        infer_handle = None
-                        inference_channel = self.reward_channel
+                    with timer("recv_rollout"):
+                        # Receive rollout trajectories in actor
+                        self.actor.recv_rollout_trajectories(
+                            input_channel=self.actor_channel
+                        ).wait()
+                        rollout_handle.wait()
+                    with timer("cal_adv_and_returns"):
+                        # Compute advantages and returns
+                        with self.timer("cal_adv_and_returns"):
+                            actor_rollout_metrics = (
+                                self.actor.compute_advantages_and_returns().wait()
+                            )
+                    with timer("run_training"):
+                        # Actor training (no input_channel needed - data is in self.rollout_batch)
+                        actor_training_handle: Handle = self.actor.run_training()
+                        
+                        actor_training_metrics = actor_training_handle.wait()
 
-                    # Actor training
-                    actor_handle: Handle = self.actor.run_training(
-                        input_channel=inference_channel,
-                    )
+                    with timer("schedule_wait"):
+                        if self.scheduler is not None:
+                            scheduler_handle.wait()
+                        
+                        self.global_steps += 1
 
-                    metrics = actor_handle.wait()
-
-                    if self.scheduler is not None:
-                        scheduler_handle.wait()
-                    actor_rollout_metrics = metrics[0][0]
-                    actor_training_metrics = metrics[0][1]
-                    self.global_steps += 1
-
-                    run_time_exceeded = self.run_timer.is_finished()
-                    _, save_model, is_train_end = check_progress(
-                        self.global_steps,
-                        self.max_steps,
-                        self.cfg.runner.val_check_interval,
-                        self.cfg.runner.save_interval,
-                        1.0,
-                        run_time_exceeded=run_time_exceeded,
-                    )
-
-                    if save_model:
-                        self._save_checkpoint()
-
-                    if is_train_end:
-                        logging.info(
-                            f"Step limit given by max_steps={self.max_steps} reached. Stopping run"
+                        run_time_exceeded = self.run_timer.is_finished()
+                        _, save_model, is_train_end = check_progress(
+                            self.global_steps,
+                            self.max_steps,
+                            self.cfg.runner.val_check_interval,
+                            self.cfg.runner.save_interval,
+                            1.0,
+                            run_time_exceeded=run_time_exceeded,
                         )
-                        return
 
-                    if run_time_exceeded:
-                        logging.info(
-                            f"Time limit given by run_timer={self.run_timer} reached. Stopping run"
-                        )
-                        return
+                        if save_model:
+                            self._save_checkpoint()
+
+                        if is_train_end:
+                            logging.info(
+                                f"Step limit given by max_steps={self.max_steps} reached. Stopping run"
+                            )
+                            return
+
+                        if run_time_exceeded:
+                            logging.info(
+                                f"Time limit given by run_timer={self.run_timer} reached. Stopping run"
+                            )
+                            return
 
                 time_metrics = self.timer.consume_durations()
-                time_metrics["training"] = actor_handle.consume_duration()
+                time_metrics["training"] = actor_training_handle.consume_duration()
                 time_metrics["rollout"] = rollout_handle.consume_duration()
-                time_metrics["reward"] = reward_handle.consume_duration()
-                if infer_handle is not None:
-                    # Inference time should be the min time across ranks, because different DP receive the rollout results differently
-                    # But at the begin of the pp schedule, there is a timer barrier
-                    # This makes all DP end at the same time, while they start at differnt times, and thus only the min time is correct
-                    time_metrics["inference"] = infer_handle.consume_duration(
-                        reduction_type="min"
-                    )
 
                 logging_steps = (
                     self.global_steps - 1
                 ) * self.cfg.algorithm.n_minibatches
                 # add prefix to the metrics
                 log_time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
+                _rollout_metrics_dict = actor_rollout_metrics[0] if isinstance(actor_rollout_metrics, list) else actor_rollout_metrics
                 rollout_metrics = {
-                    f"rollout/{k}": v for k, v in actor_rollout_metrics.items()
+                    f"rollout/{k}": v for k, v in _rollout_metrics_dict.items()
                 }
 
                 self.metric_logger.log(log_time_metrics, logging_steps)
@@ -483,16 +492,18 @@ class ReasoningRunner:
 
                 if self.cfg.actor.get("calculate_flops", False):
                     flops_metrics = self._compute_flops_metrics(
-                        time_metrics, actor_rollout_metrics
+                        time_metrics, _rollout_metrics_dict
                     )
                     flops_metrics = {f"flops/{k}": v for k, v in flops_metrics.items()}
                     self.metric_logger.log(flops_metrics, logging_steps)
                     logging_metrics.update(flops_metrics)
 
-                logging_metrics.update(actor_rollout_metrics)
+                logging_metrics.update(_rollout_metrics_dict)
                 logging_metrics.update(actor_training_metrics[-1])
 
                 global_pbar.set_postfix(logging_metrics, refresh=False)
                 global_pbar.update(1)
 
         self.metric_logger.finish()
+
+

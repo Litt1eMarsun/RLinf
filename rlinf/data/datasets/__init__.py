@@ -20,6 +20,7 @@ from omegaconf import DictConfig
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 
+from rlinf.data.datasets.alpamayo_av import AlpamayoAVDataset, load_physical_aiavdataset
 from rlinf.data.datasets.item import DatasetItem
 from rlinf.data.datasets.math import MathDataset
 from rlinf.data.datasets.vlm import VLMDatasetRegistry
@@ -78,10 +79,32 @@ def create_rl_dataset(
             tokenizer=tokenizer,
         )
         return train_dataset, val_dataset
+    elif  config.data.type == "alpamayo":
+        train_dataset = AlpamayoAVDataset(
+            config=config)
+        val_dataset = AlpamayoAVDataset(
+            config=config)
+        return train_dataset, val_dataset
     else:
         raise NotImplementedError(
             f"Unsupported dataset type {config.data.type}, only support ['math', 'vision_language', 'robot_demo']"
         )
+
+
+def av_collate_fn(data_list: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Collate function for AV dataset - simply returns the list of dictionaries.
+    
+    For AV tasks, each sample is a dict with multi-camera images and trajectories.
+    We don't stack them into batches here - the AVWorker will handle batching.
+    
+    Args:
+        data_list: List of dicts from AlpamayoAVDataset
+        
+    Returns:
+        List of sample dicts (not stacked into batches)
+    """
+    return data_list
 
 
 def collate_fn(data_list: list["DatasetItem"]) -> dict[str, Any]:

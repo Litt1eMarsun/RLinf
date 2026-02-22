@@ -19,9 +19,28 @@ from rlinf.scheduler.worker.worker import Worker
 
 def get_actor_worker(cfg: DictConfig) -> Worker:
     if cfg.actor.training_backend == "fsdp":
+        task_type = cfg.runner.get("task_type", "")
+        model_type = cfg.actor.model.get("model_type", "")
+        generation_backend = cfg.rollout.get("generation_backend", "")
+        
+        # Use AVFSDPActor for AV tasks
+        if task_type == "av" or generation_backend == "av":
+            from .fsdp_actor_worker import AVFSDPActor
+            return AVFSDPActor
+        
+        # Use EmbodiedFSDPActor for embodied tasks (needs env worker)
+        if (
+            task_type == "embodied" or
+            model_type in ["openvla", "openvla_oft", "gr00t"] or
+            "env" in cfg.get("cluster", {}).get("component_placement", {})
+        ):
+            from .fsdp_actor_worker import EmbodiedFSDPActor
+            return EmbodiedFSDPActor
+        
+        # Use standard FSDPActor for LLM tasks
         from .fsdp_actor_worker import FSDPActor
-
         return FSDPActor
+        
     elif cfg.actor.training_backend == "megatron":
         from .megatron_actor_worker import MegatronActor
 

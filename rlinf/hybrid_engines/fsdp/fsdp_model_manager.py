@@ -38,6 +38,20 @@ from rlinf.hybrid_engines.fsdp.utils import (
 from rlinf.utils.logging import get_logger
 from rlinf.utils.utils import warmup_optimizer_state
 
+
+def _ensure_custom_model_registered(model_type: str) -> None:
+    """
+    Ensure custom model types are registered before loading tokenizer.
+    This is needed because AutoTokenizer internally calls AutoConfig.from_pretrained,
+    which fails if the model type is not registered.
+    """
+    if model_type and "alpamayo" in model_type.lower():
+        try:
+            # Import alpamayo_r1 module to trigger model registration
+            import rlinf.models.embodiment.alpamayor1.alpamayo_r1  # noqa: F401
+        except ImportError:
+            pass  # Module may not be available in all environments
+
 warnings.filterwarnings(
     "ignore",
     message=".*NO_SHARD.*full_state_dict.*",
@@ -71,7 +85,38 @@ class FSDPModelManager:
         self.store_requires_grad_param_name = []
 
         if cfg.get("tokenizer", {}).get("tokenizer_model", None) is not None:
-            self.tokenizer = hf_tokenizer(cfg.tokenizer.tokenizer_model)
+            # Ensure custom model types are registered before loading tokenizer
+            model_type = cfg.model.get("model_type", "")
+            _ensure_custom_model_registered(model_type)
+            
+            # Get trust_remote_code from config, default to True for compatibility
+            trust_remote_code = cfg.tokenizer.get("trust_remote_code", True)
+            
+            # For Alpamayo models, use the base VLM tokenizer instead
+            tokenizer_path = cfg.tokenizer.tokenizer_model
+            if model_type and "alpamayo" in model_type.lower():
+                # Load config to get vlm_name_or_path
+                try:
+                    from transformers import AutoConfig
+                    model_config = AutoConfig.from_pretrained(
+                        cfg.model.model_path, 
+                        trust_remote_code=True
+                    )
+                    if hasattr(model_config, 'vlm_name_or_path'):
+                        tokenizer_path = model_config.vlm_name_or_path
+                        self._logger.info(
+                            f"[FSDP] Using base VLM tokenizer: {tokenizer_path} "
+                            f"instead of {cfg.tokenizer.tokenizer_model}"
+                        )
+                except Exception as e:
+                    self._logger.warning(
+                        f"[FSDP] Failed to get base VLM path, using configured path: {e}"
+                    )
+            
+            self.tokenizer = hf_tokenizer(
+                tokenizer_path,
+                trust_remote_code=trust_remote_code
+            )
 
         self._device_mesh = create_device_mesh(
             world_size, self._cfg.fsdp_config.get("fsdp_size", -1)

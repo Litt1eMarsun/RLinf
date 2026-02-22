@@ -85,12 +85,12 @@ def compute_gae_advantages_and_returns(
 
     return advantages, returns
 
-
+# 这里修改，增加了loss_mask的处理，避免部分结果为空导致的失败
 @register_advantage("grpo")
 def compute_grpo_advantages(
     rewards: torch.Tensor,
-    loss_mask: torch.Tensor,
-    group_size: int,
+    loss_mask: torch.Tensor = None,
+    group_size: int = 1,
     **kwargs,
 ):
     """
@@ -98,7 +98,7 @@ def compute_grpo_advantages(
 
     Args:
         rewards (torch.Tensor): Reward or score values. Shape: [num_groups, group_size]
-        loss_mask (torch.Tensor): Loss mask for valid entries. Shape: [num_groups, group_size]
+        loss_mask (torch.Tensor, optional): Loss mask for valid entries. Shape: [num_groups, group_size]
         group_size (int): Group size for advantage computation.
 
     Returns:
@@ -116,7 +116,19 @@ def compute_grpo_advantages(
     advantages = grouped_rewards - grouped_reward_mean
     advantages = advantages / (grouped_reward_std + 1e-6)
 
-    advantages = (torch.zeros_like(loss_mask) + advantages.view(1, -1)) * loss_mask
+    # Handle case when loss_mask is None (e.g., in AV tasks with sequence-level rewards)
+    if loss_mask is not None:
+        # For token-level tasks: expand advantages to match loss_mask shape [n_steps, bsz]
+        advantages = (torch.zeros_like(loss_mask) + advantages.view(1, -1)) * loss_mask
+    else:
+        # For sequence-level tasks (AV): expand advantages to all timesteps
+        # Input: [num_groups, group_size] where num_groups * group_size = bsz
+        # Output: [n_steps, bsz] flattened to [n_steps * bsz]
+        n_steps = kwargs.get("n_steps", 1)
+        bsz = advantages.numel()  # num_groups * group_size
+        advantages = advantages.reshape(-1)  # [bsz]
+        # Repeat advantages for all timesteps: [bsz] -> [n_steps, bsz] -> [n_steps * bsz]
+        advantages = advantages.unsqueeze(0).expand(n_steps, bsz).reshape(-1)
 
     return advantages, None
 

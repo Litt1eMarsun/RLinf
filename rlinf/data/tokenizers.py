@@ -65,6 +65,12 @@ def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kw
         )
         kwargs["eos_token"] = "<end_of_turn>"
         kwargs["eos_token_id"] = 107
+    
+    # Set trust_remote_code=True by default if not explicitly provided
+    # This is needed for custom model types like alpamayo_r1
+    if "trust_remote_code" not in kwargs:
+        kwargs["trust_remote_code"] = True
+    
     tokenizer = AutoTokenizer.from_pretrained(name_or_path, **kwargs)
     if correct_pad_token:
         set_pad_token_id(tokenizer)
