@@ -23,70 +23,12 @@ from typing import Any, Dict
 import einops
 import torch
 import torch.nn.functional as F
-from transformers import AutoProcessor
+from transformers.generation.logits_process import LogitsProcessorList
 
 from .alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
+from .helper import ConditionalTrajLogitsProcessor, create_message, get_processor
 
 logger = logging.getLogger(__name__)
-
-
-# Helper functions from alpamayo_r1/helper.py
-MIN_PIXELS = 163840
-MAX_PIXELS = 196608
-BASE_PROCESSOR_NAME = "Qwen/Qwen3-VL-2B-Instruct"
-
-
-def create_message(frames: torch.Tensor):
-    """Construct the message using images."""
-    assert frames.ndim == 4, f"{frames.ndim=}, expected (N, C, H, W)"
-    
-    num_traj_token = 48
-    hist_traj_placeholder = (
-        f"<|traj_history_start|>{'<|traj_history|>' * num_traj_token}<|traj_history_end|>"
-    )
-    
-    return [
-        {
-            "role": "system",
-            "content": [
-                {
-                    "type": "text",
-                    "text": "You are a driving assistant that generates safe and accurate actions.",
-                }
-            ],
-        },
-        {
-            "role": "user",
-            "content": [{"type": "image", "image": frame} for frame in frames]
-            + [
-                {
-                    "type": "text",
-                    "text": f"{hist_traj_placeholder}output the chain-of-thought reasoning of the driving process, then output the future trajectory.",
-                }
-            ],
-        },
-        {
-            "role": "assistant",
-            "content": [
-                {
-                    "type": "text",
-                    "text": "<|cot_start|>",
-                }
-            ],
-        },
-    ]
-
-
-def get_processor(tokenizer) -> AutoProcessor:
-    """Get the processor for the Qwen3-VL-2B-Instruct model."""
-    processor_kwargs = {
-        "min_pixels": MIN_PIXELS,
-        "max_pixels": MAX_PIXELS,
-    }
-    
-    processor = AutoProcessor.from_pretrained(BASE_PROCESSOR_NAME, **processor_kwargs)
-    processor.tokenizer = tokenizer
-    return processor
 
 
 class AlpamayoR1ForRL(AlpamayoR1):
@@ -353,20 +295,50 @@ class AlpamayoR1ForRL(AlpamayoR1):
         
         prompt_length = input_ids.shape[1] 
         # 3. Generate trajectory tokens with VLM
+        #
+        # tokens_per_traj: total AR trajectory tokens = product of action_space_dims
+        # e.g. UnicycleAccelCurvature with 64 waypoints × 2 dims = 128 tokens
+        action_space_dims = self.traj_tokenizer.action_space.get_action_space_dims()
+        tokens_per_traj = 1
+        for d in action_space_dims:
+            tokens_per_traj *= d
+
+        # max_new_tokens 必须足够容纳 CoT + 1(start) + tokens_per_traj + 1(end)
+        # 默认给 CoT 留 256 token，加上轨迹部分
+        default_max_new_tokens = 256 + 1 + tokens_per_traj + 1
+        max_new_tokens = kwargs.get("max_new_tokens", default_max_new_tokens)
+
+        # ConditionalTrajLogitsProcessor：
+        #   CoT 阶段屏蔽轨迹 token；
+        #   traj_future_start 之后限制只生成轨迹 token；
+        #   tokens_per_traj 个轨迹 token 后强制输出 traj_future_end。
+        traj_token_offset = self.future_token_start_idx
+        traj_vocab_size = self.traj_tokenizer.vocab_size
+        logits_processor = LogitsProcessorList([
+            ConditionalTrajLogitsProcessor(
+                traj_start_id=self.traj_future_start_id,
+                traj_end_id=self.traj_future_end_id,
+                traj_token_offset=traj_token_offset,
+                traj_vocab_size=traj_vocab_size,
+                tokens_per_traj=tokens_per_traj,
+            )
+        ])
+
         generation_config = self.vlm.generation_config
         generation_config.do_sample = kwargs.get("do_sample", True)
         generation_config.temperature = kwargs.get("temperature", 0.6)
         generation_config.top_p = kwargs.get("top_p", 0.98)
         generation_config.top_k = kwargs.get("top_k", None)
-        generation_config.max_new_tokens = kwargs.get("max_new_tokens", 256)
+        generation_config.max_new_tokens = max_new_tokens
         generation_config.output_logits = True
         generation_config.return_dict_in_generate = True
         generation_config.pad_token_id = self.tokenizer.pad_token_id
-        
+
         with torch.no_grad():
             outputs = self.vlm.generate(
                 input_ids=input_ids,
                 generation_config=generation_config,
+                logits_processor=logits_processor,
                 **tokenized_data,
             )
         
@@ -387,8 +359,7 @@ class AlpamayoR1ForRL(AlpamayoR1):
                 start_pos = start_mask.nonzero(as_tuple=True)[0][0].item() + 1
             else:
                 start_pos = 0
-                assert f"No <|traj_future_start|> found in sequence {b}, using full sequence"
-                # logger.warning(f"No <|traj_future_start|> found in sequence {b}, using full sequence")
+                logger.warning(f"No <|traj_future_start|> found in sequence {b}, using full sequence")
             
             if end_mask.any():
                 end_pos = end_mask.nonzero(as_tuple=True)[0][0].item()
@@ -409,12 +380,7 @@ class AlpamayoR1ForRL(AlpamayoR1):
         )
         for b, action_tokens in enumerate(action_tokens_list):
             action_tokens_padded[b, :len(action_tokens)] = action_tokens
-        
-        # Pad/truncate to exact tokens per trajectory (n_waypoints * 2) for decode
-        action_space_dims = self.traj_tokenizer.action_space.get_action_space_dims()
-        tokens_per_traj = 1
-        for d in action_space_dims:
-            tokens_per_traj *= d
+
         if action_tokens_padded.shape[1] != tokens_per_traj:
             if action_tokens_padded.shape[1] > tokens_per_traj:
                 action_tokens_padded = action_tokens_padded[:, :tokens_per_traj]
@@ -428,11 +394,26 @@ class AlpamayoR1ForRL(AlpamayoR1):
                 )
                 action_tokens_padded = torch.cat([action_tokens_padded, padding], dim=1)
         
-        # 5. Decode trajectory using delta_tokenizer
+        # 5. Decode trajectory using traj_tokenizer
+        #
+        # !! BUG FIX !!
+        # action_tokens_padded 里存的是绝对词表 ID（traj_token_start_idx + relative_id）。
+        # DiscreteTrajectoryTokenizer.decode() 期望的是 0-based 相对索引（0 ~ num_bins-1）。
+        # 必须先减去偏移量，否则 action / (num_bins - 1) 会放大 ~150 倍，导致 1000m+ ADE。
+        action_tokens_relative = (action_tokens_padded - self.future_token_start_idx).clamp(
+            0, self.traj_tokenizer.vocab_size - 1
+        )
+        logger.debug(
+            f"action_tokens_padded range: [{action_tokens_padded.min().item()}, "
+            f"{action_tokens_padded.max().item()}]  "
+            f"→ relative range: [{action_tokens_relative.min().item()}, "
+            f"{action_tokens_relative.max().item()}]  "
+            f"(traj_token_offset={self.future_token_start_idx})"
+        )
         pred_xyz, pred_rot, _ = self.traj_tokenizer.decode(
             hist_xyz=ego_history_xyz[:, -1],  # [B, T_hist, 3]
             hist_rot=ego_history_rot[:, -1],  # [B, T_hist, 3, 3]
-            tokens=action_tokens_padded,
+            tokens=action_tokens_relative,    # 0-based 相对索引
         )
         
         # 6. Compute logprobs from generation outputs

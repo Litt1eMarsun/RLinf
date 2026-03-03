@@ -201,14 +201,14 @@ class FSDPStrategyBase(ABC):
             raise e
         torch.distributed.barrier()
 
-        opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
-        sd_save_path = os.path.join(save_path, "model_state_dict")
-        model_state_dict = get_model_state_dict(model=model, options=opts)
-        if torch.distributed.get_rank() == 0:
-            os.makedirs(sd_save_path, exist_ok=True)
-            torch.save(model_state_dict, os.path.join(sd_save_path, "full_weights.pt"))
+        # opts = StateDictOptions(full_state_dict=True, cpu_offload=True)
+        # sd_save_path = os.path.join(save_path, "model_state_dict")
+        # model_state_dict = get_model_state_dict(model=model, options=opts)
+        # if torch.distributed.get_rank() == 0:
+        #     os.makedirs(sd_save_path, exist_ok=True)
+        #     torch.save(model_state_dict, os.path.join(sd_save_path, "full_weights.pt"))
 
-        torch.distributed.barrier()
+        # torch.distributed.barrier()
 
     @classmethod
     def load_checkpoint(
