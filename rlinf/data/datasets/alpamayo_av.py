@@ -93,6 +93,10 @@ class AlpamayoAVDataset(Dataset):
         self.maybe_stream = config.get("maybe_stream", True)
         self.initial_timestamp_us = config.get("initial_timestamp_us", 5_100_000)
         
+        max_samples = config.get("max_samples", None)
+        if max_samples is not None and max_samples < len(self.clip_ids):
+            self.clip_ids = self.clip_ids[:max_samples]
+        
         # Camera configuration
         camera_feature_names = config.get("camera_features", None)
         if camera_feature_names is None:

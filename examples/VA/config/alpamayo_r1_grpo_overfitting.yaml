@@ -1,0 +1,205 @@
+defaults:
+  - training_backend/fsdp@actor.fsdp_config
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    actor,rollout,reward: all  # 添加 reward 组件（即使不使用）
+
+runner:
+  task_type: av  # Use AV runner for autonomous vehicle tasks
+  logger:
+    log_path: ${runner.output_dir}/${runner.experiment_name}
+    project_name: rlinf
+    experiment_name: ${runner.experiment_name}
+    logger_backends: ["wandb"]  # wandb, swanlab
+
+  max_epochs: 20
+  max_steps: -1
+
+  only_eval: False
+  val_check_interval: 5
+  save_interval: 10
+
+  seq_length: 8192  # Maximum sequence length for model
+  enable_dynamic_batch_size: False
+  max_tokens_per_mbs: 8192
+
+  resume_dir: null
+  ckpt_path: null
+  
+  experiment_name: "alpamayo_r1_grpo_av_overfitting"
+  output_dir: ../results
+
+# Dataset configuration
+data:
+  type: av  # AV task type
+  max_prompt_length: 2048  # Maximum prompt length
+  filter_prompt_by_length: True
+  rollout_batch_size: 8
+  val_rollout_batch_size: 8  # 原 32 会导致验证时 ChannelWorker CPU OOM（32样本×大图）
+  num_workers: 4
+  shuffle: False
+  validation_shuffle: False
+  seed: 42
+  
+  train:
+    data_path: "/data/workspace/RLinf/data/clip_index.parquet"
+    cache_dir: "/data/workspace/RLinf/data"
+    num_history_steps: 16
+    num_future_steps: 64
+    time_step: 0.1
+    num_frames: 4
+    maybe_stream: False
+    initial_timestamp_us: 5100000
+    max_samples: 16
+  
+  val:
+    data_path: "/data/workspace/RLinf/data/clip_index.parquet"
+    cache_dir: "/data/workspace/RLinf/data"
+    num_history_steps: 16
+    num_future_steps: 64
+    time_step: 0.1
+    num_frames: 4
+    maybe_stream: False
+    initial_timestamp_us: 5100000
+    max_samples: 16
+
+algorithm:
+  group_size: 8  # GRPO group size (每个prompt生成8个候选)
+  
+  n_minibatches: 1
+  training_batch_size_per_gpu: 8
+  rollout_batch_size_per_gpu: null
+  logprob_forward_micro_batch_size: 8
+  val_rollout_batch_size_per_gpu: 8
+  
+  recompute_logprobs: False
+  shuffle_rollout: False
+  
+  normalize_advantages: True
+  kl_penalty: kl
+  reward_coef: 1.0
+  rollout_epoch: 1
+  eval_rollout_epoch: 1
+
+  reward_type: sequence_level  # Single reward per trajectory
+  logprob_type: token_level
+  entropy_type: token_level
+
+  update_epoch: 2
+  adv_type: grpo
+  loss_type: actor
+  loss_agg_func: "token-mean"
+  kl_beta: 0.0
+  kl_penalty_type: low_var_kl
+  entropy_bonus: 0.01
+  calculate_entropy: False
+  clip_ratio_high: 0.2
+  clip_ratio_low: 0.2
+  clip_ratio_c: 3.0
+  value_clip: 0.2
+  huber_delta: 10.0
+  early_stop_imp_ratio: 5.0
+  use_valid_token_scale: False
+
+  gamma: 0.99
+  gae_lambda: 0.95
+
+  filter_rewards: False  # Don't filter trajectory rewards
+  
+  # Sampling parameters for trajectory generation
+  sampling_params:
+    do_sample: True
+    temperature: 0.6
+    temperature_train: 0.6
+    temperature_eval: 0.6
+    top_k: null
+    top_p: 0.98
+    repetition_penalty: 1.0
+    max_new_tokens: 256  # For trajectory token generation
+    min_new_tokens: 1
+
+rollout:
+  group_name: "RolloutGroup"
+  generation_backend: "av"  # Custom AV backend
+  return_logprobs: True
+  enable_offload: False
+  pipeline_stage_num: 1  # Number of pipeline stages
+
+  model:
+    model_type: "alpamayo"
+    model_path: "nvidia/Alpamayo-R1-10B"
+    precision: "bf16"
+    is_lora: False
+
+actor:
+  group_name: "ActorGroup"
+  training_backend: "fsdp"
+  micro_batch_size: 8
+  global_batch_size: 64
+  seed: 42
+  enable_offload: False
+  calculate_flops: False
+
+  model:
+    model_type: "alpamayo"
+    model_path: "nvidia/Alpamayo-R1-10B"
+    precision: "bf16"
+    is_lora: False
+    seq_length: ${runner.seq_length}
+    encoder_seq_length: ${runner.seq_length}
+    action_dim: 2  # UnicycleAccelCurvature: (accel, curvature) per waypoint
+
+  optim:
+    optimizer: adam
+    bf16: True
+    fp16: False
+    lr: 5.0e-6
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    adam_eps: 1.0e-08
+    weight_decay: 0.01
+    clip_grad: 1.0
+    use_distributed_optimizer: False
+    overlap_grad_reduce: False
+    overlap_param_gather: False
+    loss_scale: null
+
+  lr_sched:
+    lr_warmup_fraction: 0.01
+    lr_warmup_init: 0.0
+    lr_warmup_iters: 0
+    max_lr: 1.0e-5
+    min_lr: 0.0
+    lr_decay_style: constant
+    lr_decay_iters: 10
+
+  tokenizer:
+    tokenizer_model: "Qwen/Qwen3-VL-2B-Instruct"  # Use base VLM tokenizer
+    use_fast: False
+    trust_remote_code: True
+    padding_side: 'right'
+
+  fsdp_config:
+    strategy: "fsdp"
+    sharding_strategy: "full_shard"
+    cpu_offload: False
+    gradient_checkpointing: True
+    use_orig_params: False
+    mixed_precision:
+      param_dtype: ${actor.model.precision}
+      reduce_dtype: ${actor.model.precision}
+      buffer_dtype: "fp32"
+
+reward:
+  use_reward_model: False  # Rewards computed in AVWorker
+
+critic:
+  use_critic_model: False  # GRPO doesn't need critic
