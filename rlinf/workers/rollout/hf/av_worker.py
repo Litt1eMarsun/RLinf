@@ -341,7 +341,7 @@ class AVWorker(Worker):
                 moved_batch[key] = value
         return moved_batch
     
-    def _compute_rewards(self, result: Dict[str, Any]) -> torch.Tensor:
+    def _compute_rewards(self, result: Dict[str, Any], selected_idx: list = None) -> torch.Tensor:
         """
         Compute rewards based on trajectory prediction accuracy.
         Uses minimum Average Displacement Error (minADE).
@@ -350,6 +350,7 @@ class AVWorker(Worker):
             result: Model prediction result containing:
                 - pred_xyz: [B, T_fut, 3]
                 - gt_xyz: [B, 1, T_fut, 3]
+            selected_idx:[B, T_sel_future] choosen point for reward
         
         Returns:
             rewards: [B] tensor of rewards
@@ -361,23 +362,30 @@ class AVWorker(Worker):
             logger.warning("No ground truth available, returning zero rewards")
             return torch.zeros(pred_xyz.shape[0], device=pred_xyz.device)
         
-        # Remove the trajectory group dimension from ground truth
         gt_xyz = gt_xyz[:, 0, :, :]  # [B, T_fut, 3]
         
+        if selected_idx is None:
+            pred_length = pred_xyz.shape[1]
+            selected_gap = pred_length // 4
+            selected_idx = [(i + 1) * selected_gap - 1 for i in range(4)]
+        
+        pred_xyz_select = pred_xyz[:, selected_idx, :]
+        gt_xyz_select = gt_xyz[:, selected_idx, :]
+
         # Compute ADE (Average Displacement Error)
         # ADE = mean of L2 distances across time steps
-        displacement = torch.norm(pred_xyz - gt_xyz, dim=-1)  # [B, T_fut]
+        displacement = torch.norm(pred_xyz_select - gt_xyz_select, dim=-1)  # [B, T_fut]
         ade = displacement.mean(dim=-1)  # [B]
         
         # Convert to reward (negative error)
         # We use negative ADE as reward (higher is better)
+        # Linear reward is robust when ADE is large (early training), avoids numerical underflow.
+        # exp(-ade/threshold) collapses to 0 when ADE >> threshold.
         rewards = -ade
         
-        # Optional: Apply reward shaping (e.g., exponential)
-        # rewards = torch.exp(-ade / threshold)
-        
+        std_str = f"{rewards.std(correction=0).item():.4f}" if rewards.numel() > 1 else "N/A"
         logger.info(f"Computed rewards - mean: {rewards.mean().item():.4f}, "
-                   f"std: {rewards.std().item():.4f}, "
+                   f"std: {std_str}, "
                    f"min: {rewards.min().item():.4f}, "
                    f"max: {rewards.max().item():.4f}")
         
