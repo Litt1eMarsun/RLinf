@@ -93,6 +93,9 @@ class AVWorker(Worker):
         """Initialize the model."""
         logger.info(f"Initializing AVWorker on rank {self._rank}")
         
+        self._enable_offload = self._cfg.rollout.get("enable_offload", False)
+        self._device = torch.cuda.current_device()
+
         # Load model configuration
         rollout_model_config = self._cfg.rollout.model
         torch_dtype = torch_dtype_from_precision(rollout_model_config.precision)
@@ -104,8 +107,24 @@ class AVWorker(Worker):
             self._model = self._model.cuda()
         
         self._model.eval()
+
+        if self._enable_offload:
+            self._offload_model()
+            logger.info(f"AVWorker model offloaded to CPU after init (enable_offload=True)")
         
         logger.info(f"AVWorker initialized successfully on rank {self._rank}")
+
+    def _offload_model(self) -> None:
+        """将推理模型从 GPU 卸载到 CPU，释放显存供 Actor training 使用。"""
+        self._model = self._model.to("cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info(f"AVWorker model offloaded to CPU on rank {self._rank}")
+
+    def _reload_model(self) -> None:
+        """将推理模型从 CPU 重新加载到 GPU，准备 rollout。"""
+        self._model = self._model.to(self._device)
+        logger.info(f"AVWorker model reloaded to GPU on rank {self._rank}")
     
     async def sync_model_from_actor(self) -> None:
         """
@@ -117,6 +136,10 @@ class AVWorker(Worker):
         """
         logger.info(f"Syncing model weights from actor on rank {self._rank}")
         
+        # Weight sync 需要模型在 GPU 上才能接收 NCCL 数据
+        if self._enable_offload:
+            self._reload_model()
+
         # Receive model state dict from actor
         param_state_dict = await self.recv(
             self.actor_group_name,
@@ -138,6 +161,10 @@ class AVWorker(Worker):
         del param_state_dict
         gc.collect()
         torch.cuda.empty_cache()
+
+        # sync 完成后立即 offload，让 Actor training 有足够显存
+        if self._enable_offload:
+            self._offload_model()
         
         logger.info(
             f"Model weights synced successfully on rank {self._rank}, "
@@ -152,8 +179,13 @@ class AVWorker(Worker):
             input_channel: Channel to receive RolloutRequest from DataLoader
             output_channel: Channel to send RolloutResult to Actor
         """
+        if self._enable_offload:
+            self._reload_model()
         with self.worker_timer():
             await self._rollout_impl(input_channel, output_channel)
+        if self._enable_offload:
+            self._offload_model()
+
 
     async def _rollout_impl(self, input_channel: Channel, output_channel: Channel) -> None:
         logger.info(f"Starting rollout on rank {self._rank}")
