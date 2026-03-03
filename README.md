@@ -29,6 +29,76 @@ RLinf is a flexible and scalable open-source RL infrastructure designed for Embo
 </div>
 
 
+## Quick Start: Alpamayo-R1 GRPO Training
+
+Train Alpamayo-R1 with GRPO on AV trajectory prediction using a small overfitting example.
+
+**1. Set data paths** in `examples/VA/config/alpamayo_r1_grpo_overfitting.yaml`:
+
+```yaml
+data:
+  train:
+    data_path: "/your/path/clip_index.parquet"
+    cache_dir: "/your/path/data"
+  val:
+    data_path: "/your/path/clip_index.parquet"
+    cache_dir: "/your/path/data"
+```
+
+**2. Run training:**
+
+```bash
+cd examples/VA
+python overfitting_alpamayo.py
+```
+
+Key config options:
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `data.train.max_samples` | `16` | Number of training samples (overfitting uses 16) |
+| `algorithm.group_size` | `8` | GRPO candidates per prompt |
+| `actor.model.model_path` | `nvidia/Alpamayo-R1-10B` | Model checkpoint path |
+| `runner.max_epochs` | `20` | Total training epochs |
+
+Results are saved to `examples/results/`.
+
+### Visualize Rollout Trajectories
+
+Compare predicted trajectories against ground truth for a trained model:
+
+```bash
+cd examples/VA
+
+# Use original SFT weights (no RL checkpoint)
+python visualize_rollout.py \
+    --model_path nvidia/Alpamayo-R1-10B \
+    --checkpoint_dir "" \
+    --data_path /your/path/clip_index.parquet \
+    --cache_dir /your/path/data \
+    --output rollout_vis.png
+
+# Use a saved RL checkpoint
+python visualize_rollout.py \
+    --checkpoint_dir /your/results/checkpoints/global_step_40/actor \
+    --data_path /your/path/clip_index.parquet \
+    --cache_dir /your/path/data \
+    --output rollout_vis_rl.png
+```
+
+Key arguments:
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--checkpoint_dir` | *(RL ckpt path)* | RL checkpoint dir; set `""` to use raw SFT weights |
+| `--data_path` | — | Path to `clip_index.parquet` |
+| `--num_samples` | `8` | Number of samples to visualize |
+| `--output` | `rollout_visualization.png` | Output image path |
+
+The script prints per-sample **ADE** (Average Displacement Error) and saves a side-by-side plot of predicted vs. GT trajectories.
+
+---
+
 ## What's NEW!
 - [2026/01] 🔥 RLinf supports reinforcement learning fine-tuning for [OpenSora World Model](https://github.com/hpcaitech/Open-Sora). Doc: [RL on OpenSora World Model](https://rlinf.readthedocs.io/en/latest/rst_source/examples/opensora.html).
 - [2026/01] 🔥 RLinf supports reinforcement learning fine-tuning for [RoboTwin](https://github.com/robotwin-Platform/RoboTwin). Doc: [RL on RoboTwin](https://rlinf.readthedocs.io/en/latest/rst_source/examples/robotwin.html).
