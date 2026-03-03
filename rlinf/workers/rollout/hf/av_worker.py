@@ -185,7 +185,23 @@ class AVWorker(Worker):
             await self._rollout_impl(input_channel, output_channel)
         if self._enable_offload:
             self._offload_model()
-
+  
+  def _expand_batch_for_group(self, batch: Dict[str, Any], group_size: int) -> Dict[str, Any]:
+        """将 [B, ...] 的 batch 沿 batch 维复制 group_size 份，变成 [B*group_size, ...]。
+        
+        复制顺序为 scene-major（repeat_interleave），即：
+        [s0, s0, ..., s0, s1, s1, ..., s1, ...]
+        每个场景连续出现 group_size 次，保证同一场景的多次采样紧邻。
+        """
+        expanded = {}
+        for key, value in batch.items():
+            if isinstance(value, torch.Tensor):
+                expanded[key] = value.repeat_interleave(group_size, dim=0)
+            elif isinstance(value, list):
+                expanded[key] = [item for item in value for _ in range(group_size)]
+            else:
+                expanded[key] = value
+        return expanded
 
     async def _rollout_impl(self, input_channel: Channel, output_channel: Channel) -> None:
         logger.info(f"Starting rollout on rank {self._rank}")
@@ -198,35 +214,85 @@ class AVWorker(Worker):
         num_samples = len(rollout_request.multi_modal_inputs) if rollout_request.multi_modal_inputs else len(rollout_request.input_ids)
         logger.info(f"Received rollout request with {num_samples} samples")
         
-        # Process the batch
-        # For AV tasks, data is in multi_modal_inputs, not input_ids
         batch_data_list = rollout_request.multi_modal_inputs
         
         if batch_data_list is None or len(batch_data_list) == 0:
             logger.error("No batch data found in rollout request")
             return
         
-        # Collate batch data
-        batch = self._collate_batch(batch_data_list)
+        B = len(batch_data_list)
+        group_size = self._cfg.algorithm.group_size
         device = self._model.vlm.device
+
+        # Collate 原始 batch: [B, ...]
+        batch = self._collate_batch(batch_data_list)
         batch = self._move_to_device(batch, device)
+
+        # 将 batch 沿 batch 维复制 group_size 份: [B*group_size, ...]
+        # scene-major 顺序: [s0_g0, s0_g1, ..., s0_gG-1, s1_g0, ...]
+        expanded_batch = self._expand_batch_for_group(batch, group_size)
+        total_samples = B * group_size
+        logger.info(f"Batch expanded: {B} scenes × {group_size} groups = {total_samples} samples")
+
+        # 根据显存容量分 chunk 执行，避免一次性放不下
+        rollout_micro_batch_size = self._cfg.rollout.get("micro_batch_size", total_samples)
+        num_chunks = (total_samples + rollout_micro_batch_size - 1) // rollout_micro_batch_size
         
-        # Run model inference
+        chunk_results = []
+        chunk_rewards = []
+
         with torch.no_grad():
-            actions, result = self._model.predict_action_batch(
-                batch,
-                mode="train",
-                **self._sampling_params
-            )
-        
-        # Compute rewards
-        rewards = self._compute_rewards(result)
-        
+            for chunk_idx in range(num_chunks):
+                start = chunk_idx * rollout_micro_batch_size
+                end = min(start + rollout_micro_batch_size, total_samples)
+                
+                # 切出当前 micro batch
+                micro_batch = {}
+                for key, value in expanded_batch.items():
+                    if isinstance(value, torch.Tensor):
+                        micro_batch[key] = value[start:end]
+                    elif isinstance(value, list):
+                        micro_batch[key] = value[start:end]
+                    else:
+                        micro_batch[key] = value
+
+                actions, result = self._model.predict_action_batch(
+                    micro_batch,
+                    mode="train",
+                    **self._sampling_params
+                )
+                rewards = self._compute_rewards(result)
+                chunk_results.append(result)
+                chunk_rewards.append(rewards)
+
+        # 拼接所有 chunk 的结果: 已经是 [B*group_size, ...] scene-major 顺序
+        if num_chunks == 1:
+            merged_result = chunk_results[0]
+            merged_rewards = chunk_rewards[0]
+        else:
+            merged_rewards = torch.cat(chunk_rewards, dim=0)
+            merged_result = {}
+            for key in chunk_results[0]:
+                val = chunk_results[0][key]
+                if isinstance(val, torch.Tensor):
+                    merged_result[key] = torch.cat([r[key] for r in chunk_results], dim=0)
+                elif isinstance(val, dict):
+                    merged_dict = {}
+                    for k, v in val.items():
+                        if isinstance(v, torch.Tensor):
+                            merged_dict[k] = torch.cat([r[key][k] for r in chunk_results], dim=0)
+                        else:
+                            merged_dict[k] = v
+                    merged_result[key] = merged_dict
+                else:
+                    merged_result[key] = val
+
         # Prepare trajectory for actor
         trajectory = self._prepare_trajectory(
             rollout_request,
-            result,
-            rewards
+            merged_result,
+            merged_rewards,
+            batch_size=total_samples,
         )
         
         # Send trajectory to output channel
@@ -321,7 +387,8 @@ class AVWorker(Worker):
         self,
         rollout_request: RolloutRequest,
         result: Dict[str, Any],
-        rewards: torch.Tensor
+        rewards: torch.Tensor,
+        batch_size: int = None,
     ):
         """
         Prepare Trajectory object for actor training.
@@ -330,13 +397,15 @@ class AVWorker(Worker):
             rollout_request: Original request
             result: Model prediction result
             rewards: Computed rewards
+            batch_size: Total number of sequences (scenes * group_size). If None, inferred from rewards.
         
         Returns:
             Trajectory object
         """
         from rlinf.data.embodied_io_struct import Trajectory
         
-        batch_size = len(rollout_request.multi_modal_inputs)
+        if batch_size is None:
+            batch_size = len(rollout_request.multi_modal_inputs)
         
         # Extract data from result
         prev_logprobs = result.get("prev_logprobs")  # [B, num_tokens]

@@ -425,7 +425,6 @@ class AVRunner:
                         rollout_handle.wait()
                     with timer("cal_adv_and_returns"):
                         # Compute advantages and returns
-                        with self.timer("cal_adv_and_returns"):
                             actor_rollout_metrics = (
                                 self.actor.compute_advantages_and_returns().wait()
                             )
