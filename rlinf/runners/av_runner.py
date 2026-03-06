@@ -465,43 +465,44 @@ class AVRunner:
                             )
                             return
 
-                time_metrics = self.timer.consume_durations()
-                time_metrics["training"] = actor_training_handle.consume_duration()
-                time_metrics["rollout"] = rollout_handle.consume_duration()
+                        # ---- per-step logging (moved inside inner loop) ----
+                        time_metrics = self.timer.consume_durations()
+                        time_metrics["training"] = actor_training_handle.consume_duration()
+                        time_metrics["rollout"] = rollout_handle.consume_duration()
 
-                logging_steps = (
-                    self.global_steps - 1
-                ) * self.cfg.algorithm.n_minibatches
-                # add prefix to the metrics
-                log_time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
-                _rollout_metrics_dict = actor_rollout_metrics[0] if isinstance(actor_rollout_metrics, list) else actor_rollout_metrics
-                rollout_metrics = {
-                    f"rollout/{k}": v for k, v in _rollout_metrics_dict.items()
-                }
+                        logging_steps = (
+                            self.global_steps - 1
+                        ) * self.cfg.algorithm.n_minibatches
+                        # add prefix to the metrics
+                        log_time_metrics = {f"time/{k}": v for k, v in time_metrics.items()}
+                        _rollout_metrics_dict = actor_rollout_metrics[0] if isinstance(actor_rollout_metrics, list) else actor_rollout_metrics
+                        rollout_metrics = {
+                            f"rollout/{k}": v for k, v in _rollout_metrics_dict.items()
+                        }
 
-                self.metric_logger.log(log_time_metrics, logging_steps)
-                self.metric_logger.log(rollout_metrics, logging_steps)
-                for i in range(self.cfg.algorithm.n_minibatches):
-                    training_metrics = {
-                        f"train/{k}": v for k, v in actor_training_metrics[i].items()
-                    }
-                    self.metric_logger.log(training_metrics, logging_steps + i)
+                        self.metric_logger.log(log_time_metrics, logging_steps)
+                        self.metric_logger.log(rollout_metrics, logging_steps)
+                        for i in range(self.cfg.algorithm.n_minibatches):
+                            training_metrics = {
+                                f"train/{k}": v for k, v in actor_training_metrics[i].items()
+                            }
+                            self.metric_logger.log(training_metrics, logging_steps + i)
 
-                logging_metrics = {f"{k}_time": v for k, v in time_metrics.items()}
+                        logging_metrics = {f"{k}_time": v for k, v in time_metrics.items()}
 
-                if self.cfg.actor.get("calculate_flops", False):
-                    flops_metrics = self._compute_flops_metrics(
-                        time_metrics, _rollout_metrics_dict
-                    )
-                    flops_metrics = {f"flops/{k}": v for k, v in flops_metrics.items()}
-                    self.metric_logger.log(flops_metrics, logging_steps)
-                    logging_metrics.update(flops_metrics)
+                        if self.cfg.actor.get("calculate_flops", False):
+                            flops_metrics = self._compute_flops_metrics(
+                                time_metrics, _rollout_metrics_dict
+                            )
+                            flops_metrics = {f"flops/{k}": v for k, v in flops_metrics.items()}
+                            self.metric_logger.log(flops_metrics, logging_steps)
+                            logging_metrics.update(flops_metrics)
 
-                logging_metrics.update(_rollout_metrics_dict)
-                logging_metrics.update(actor_training_metrics[-1])
+                        logging_metrics.update(_rollout_metrics_dict)
+                        logging_metrics.update(actor_training_metrics[-1])
 
-                global_pbar.set_postfix(logging_metrics, refresh=False)
-                global_pbar.update(1)
+                        global_pbar.set_postfix(logging_metrics, refresh=False)
+                        global_pbar.update(1)
 
         self.metric_logger.finish()
 
