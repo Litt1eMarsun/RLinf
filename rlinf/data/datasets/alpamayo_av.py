@@ -14,6 +14,7 @@
 
 """Dataset loader for PhysicalAI-AV (Alpamayo) autonomous driving data."""
 
+import os
 from typing import Any, Optional, Union
 
 import numpy as np
@@ -97,6 +98,16 @@ class AlpamayoAVDataset(Dataset):
         if max_samples is not None and max_samples < len(self.clip_ids):
             self.clip_ids = self.clip_ids[:max_samples]
         
+        # Decoded cache directory (pre-decoded JPEG + npz cache)
+        self.decoded_cache_dir = config.get("decoded_cache_dir", None)
+        if self.decoded_cache_dir:
+            cached_count = sum(
+                1 for cid in self.clip_ids
+                if os.path.exists(os.path.join(self.decoded_cache_dir, cid, ".done"))
+            )
+            print(f"[AlpamayoAVDataset] decoded_cache_dir={self.decoded_cache_dir}, "
+                  f"cached {cached_count}/{len(self.clip_ids)} clips")
+        
         # Camera configuration
         camera_feature_names = config.get("camera_features", None)
         if camera_feature_names is None:
@@ -133,14 +144,24 @@ class AlpamayoAVDataset(Dataset):
         df_reset = df.reset_index()
         train_clips = df_reset[df_reset['split'] == 'train']['clip_id'].tolist()
         print(f"load clip ids done, time: {time.time() - start_time:.2f}s")
-        return train_clips[:64]
+        return train_clips
     
     def __len__(self) -> int:
         return len(self.clip_ids)
     
+    def _has_decoded_cache(self, clip_id: str) -> bool:
+        """Check if a clip has pre-decoded cache available."""
+        if not self.decoded_cache_dir:
+            return False
+        return os.path.exists(os.path.join(self.decoded_cache_dir, clip_id, ".done"))
+    
     def __getitem__(self, idx: int) -> dict[str, Any]:
         """
         Load a single sample from the dataset.
+        
+        If decoded_cache_dir is set and the clip has been pre-decoded,
+        loads directly from JPEG + npz cache (fast path).
+        Otherwise falls back to zip-based loading (slow path).
         
         Args:
             idx: Index of the sample (corresponds to clip_id index)
@@ -154,22 +175,26 @@ class AlpamayoAVDataset(Dataset):
         clip_id = self.clip_ids[idx]
         t0_us = self.initial_timestamp_us
         
+        # ── Fast path: load from pre-decoded cache ──────────────────────
+        if self._has_decoded_cache(clip_id):
+            result = self._load_from_cache(clip_id)
+            t_total = time.time() - t_start
+            print(f"[Dataset] sample {idx} (cached): total={t_total:.3f}s")
+            return result
+        
+        # ── Slow path: load from zip files ──────────────────────────────
         # Load egomotion trajectories
         t0 = time.time()
-        print(f"load egomotion...")
         ego_data = self._load_egomotion(clip_id, t0_us)
         t_ego = time.time() - t0
-        print(f"load egomotion done, time: {t_ego:.2f}s")
         
         # Load multi-camera video frames
         t0 = time.time()
-        print(f"load video frames...")
         video_data = self._load_video_frames(clip_id, t0_us)
         t_video = time.time() - t0
-        print(f"load video frames done, time: {t_video:.2f}s")
         
         t_total = time.time() - t_start
-        print(f"[Dataset] sample {idx}: ego={t_ego:.2f}s, video={t_video:.2f}s, total={t_total:.2f}s")
+        print(f"[Dataset] sample {idx} (zip): ego={t_ego:.2f}s, video={t_video:.2f}s, total={t_total:.2f}s")
         
         # Combine all data
         return {
@@ -177,6 +202,68 @@ class AlpamayoAVDataset(Dataset):
             **ego_data,
             "clip_id": clip_id,
             "t0_us": t0_us,
+        }
+
+    def _load_from_cache(self, clip_id: str) -> dict[str, Any]:
+        """
+        Load a pre-decoded clip from JPEG + npz cache.
+        
+        Expected layout:
+          {decoded_cache_dir}/{clip_id}/
+            egomotion.npz          # history_xyz, history_rot, future_xyz, future_rot
+            video_meta.npz         # camera_indices, absolute_timestamps, relative_timestamps, camera_names
+            {camera_name}/
+              frame_0.jpg ... frame_{N-1}.jpg
+        """
+        clip_dir = os.path.join(self.decoded_cache_dir, clip_id)
+        
+        # ── 1. Egomotion ────────────────────────────────────────────────
+        ego = np.load(os.path.join(clip_dir, "egomotion.npz"))
+        ego_data = {
+            "ego_history_xyz": torch.from_numpy(ego["history_xyz"]).float().unsqueeze(0),
+            "ego_history_rot": torch.from_numpy(ego["history_rot"]).float().unsqueeze(0),
+            "ego_future_xyz": torch.from_numpy(ego["future_xyz"]).float().unsqueeze(0),
+            "ego_future_rot": torch.from_numpy(ego["future_rot"]).float().unsqueeze(0),
+        }
+        
+        # ── 2. Video frames ────────────────────────────────────────────
+        meta = np.load(os.path.join(clip_dir, "video_meta.npz"), allow_pickle=True)
+        camera_names = meta["camera_names"].tolist()
+        camera_indices = torch.from_numpy(meta["camera_indices"].astype(np.int64)) 
+        absolute_timestamps = torch.from_numpy(meta["absolute_timestamps"].astype(np.int64))
+        relative_timestamps = torch.from_numpy(meta["relative_timestamps"].astype(np.float32))
+        
+        from PIL import Image
+        
+        image_frames_list = []
+        for cam_name in camera_names:
+            cam_dir = os.path.join(clip_dir, cam_name)
+            frames = []
+            for fi in range(self.num_frames):
+                img_path = os.path.join(cam_dir, f"frame_{fi}.jpg")
+                img = Image.open(img_path).convert("RGB")
+                img_np = np.array(img, dtype=np.uint8)  # (H, W, 3)
+                # (H, W, C) → (C, H, W)
+                frames.append(torch.from_numpy(img_np).permute(2, 0, 1))
+            image_frames_list.append(torch.stack(frames, dim=0))  # (num_frames, C, H, W)
+        
+        image_frames = torch.stack(image_frames_list, dim=0)  # (N_cam, num_frames, C, H, W)
+        
+        # Sort by camera index for consistent ordering
+        sort_order = torch.argsort(camera_indices)
+        image_frames = image_frames[sort_order]
+        camera_indices = camera_indices[sort_order]
+        absolute_timestamps = absolute_timestamps[sort_order]
+        relative_timestamps = relative_timestamps[sort_order]
+        
+        return {
+            "image_frames": image_frames,
+            "camera_indices": camera_indices,
+            "relative_timestamps": relative_timestamps,
+            "absolute_timestamps": absolute_timestamps,
+            **ego_data,
+            "clip_id": clip_id,
+            "t0_us": self.initial_timestamp_us,
         }
     
     def _load_egomotion(self, clip_id: str, t0_us: int) -> dict[str, torch.Tensor]:

@@ -14,7 +14,12 @@
 # limitations under the License.
 
 """
-可视化脚本：加载8个数据样本进行 autoregressive rollout 推理，并可视化预测轨迹与 GT 轨迹的对比。
+可视化脚本：加载数据样本进行 autoregressive rollout 推理，并可视化预测轨迹与 GT 轨迹的对比。
+
+支持两种数据加载模式:
+  1. 原始模式: 从 zip 文件解压 + FFmpeg 解码（慢）
+  2. 缓存模式: 从预解码的 JPEG + npz 缓存加载（快）
+     通过 --decoded-cache-dir 指定缓存目录，仅加载缓存中已存在的 clip。
 
 使用 predict_action_batch（AR token 解码路径），已修复两个关键 bug：
   Bug 1：token 偏移未减去 traj_token_start_idx → 解码结果放大 ~150 倍 → 1014m ADE
@@ -22,9 +27,16 @@
 
 用法:
     cd /home/sunyujie/workspace/RLinf
-    HF_HOME=/home/sunyujie/workspace/RLinf/data/hub \\
-    HUGGING_FACE_HUB_TOKEN=<your_token> \\
-    python examples/visualize_rollout.py --output rollout_vis.png
+
+    # 原始模式
+    HF_HOME=/data/workspace/RLinf/data \\
+    python examples/VA/visualize_rollout.py --output rollout_vis.png
+
+    # 缓存模式（测试预解码 clip）
+    HF_HOME=/data/workspace/RLinf/data \\
+    python examples/VA/visualize_rollout.py \\
+        --decoded-cache-dir /data/workspace/RLinf/decoded_cache \\
+        --output rollout_vis_cached.png
 """
 
 import argparse
@@ -96,7 +108,7 @@ def load_rl_checkpoint(model: torch.nn.Module, checkpoint_dir: str) -> None:
 
     # 去掉前缀，载入模型
     model_state_dict = {k[len(prefix):]: v for k, v in sd.items()}
-    missing, unexpected = model.load_state_dict(model_state_dict, strict=True)
+    missing, unexpected = model.load_state_dict(model_state_dict, strict=False)
     if missing:
         print(f"  ⚠️  缺失 key（{len(missing)} 个）：{missing[:3]}...")
     if unexpected:
@@ -200,9 +212,11 @@ def main():
              f"默认：{_DEFAULT_CHECKPOINT_DIR}",
     )
     parser.add_argument("--data_path", type=str,
-                        default="/home/sunyujie/workspace/RLinf/data/clip_index.parquet")
+                        default="/data/workspace/RLinf/data/clip_index.parquet")
     parser.add_argument("--cache_dir", type=str,
-                        default="/home/sunyujie/workspace/RLinf/data")
+                        default="/data/workspace/RLinf/data")
+    parser.add_argument("--decoded-cache-dir", type=str, default="/home/sunyujie/workspace/RLinf/decoded_cache",
+                        help="预解码缓存目录。指定后仅加载其中已解码的 clip 进行测试。")
     parser.add_argument("--output", type=str, default="rollout_visualization.png")
     parser.add_argument("--num_samples", type=int, default=8)
     parser.add_argument("--num_history_steps", type=int, default=16)
@@ -223,7 +237,9 @@ def main():
 
     # ── 1. 加载数据 ────────────────────────────────────────────────────────────
     print("\n[1/4] 加载数据集...")
-    dataset_config = OmegaConf.create({
+
+    # 构建 dataset config
+    ds_cfg = {
         "data_path": args.data_path,
         "cache_dir": args.cache_dir,
         "num_history_steps": args.num_history_steps,
@@ -232,16 +248,41 @@ def main():
         "num_frames": args.num_frames,
         "maybe_stream": False,
         "initial_timestamp_us": args.initial_timestamp_us,
-        "max_samples": args.num_samples,
-    })
+    }
 
+    decoded_cache_dir = getattr(args, "decoded_cache_dir", None)
+    if decoded_cache_dir:
+        ds_cfg["decoded_cache_dir"] = decoded_cache_dir
+        print(f"  使用预解码缓存: {decoded_cache_dir}")
+
+        # 扫描缓存中可用的 clip（有 .done 标记的）
+        import pandas as pd
+        df = pd.read_parquet(args.data_path)
+        df_r = df.reset_index()
+        train_clips = df_r[df_r["split"] == "train"]["clip_id"].tolist()
+
+        cached_clips = [
+            cid for cid in train_clips
+            if os.path.exists(os.path.join(decoded_cache_dir, cid, ".done"))
+        ]
+        num_avail = min(args.num_samples, len(cached_clips))
+        if num_avail == 0:
+            print("  ⚠️  缓存中没有已解码的 clip！请先运行 predecode_cache.py")
+            return
+        print(f"  缓存中已解码 clip 数: {len(cached_clips)}，将使用前 {num_avail} 个")
+        ds_cfg["clip_ids"] = cached_clips[:num_avail]
+    else:
+        ds_cfg["max_samples"] = args.num_samples
+
+    dataset_config = OmegaConf.create(ds_cfg)
     dataset = AlpamayoAVDataset(dataset_config)
     print(f"  ✓ 数据集加载完成，共 {len(dataset)} 个可用样本")
 
+    num_to_load = min(args.num_samples, len(dataset))
     batch_data_list = []
     clip_ids = []
-    for i in range(min(args.num_samples, len(dataset))):
-        print(f"  加载样本 {i+1}/{args.num_samples}...")
+    for i in range(num_to_load):
+        print(f"  加载样本 {i+1}/{num_to_load}...")
         sample = dataset[i]
         batch_data_list.append(sample)
         clip_ids.append(sample["clip_id"])

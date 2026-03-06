@@ -186,7 +186,7 @@ class AVWorker(Worker):
         if self._enable_offload:
             self._offload_model()
   
-  def _expand_batch_for_group(self, batch: Dict[str, Any], group_size: int) -> Dict[str, Any]:
+    def _expand_batch_for_group(self, batch: Dict[str, Any], group_size: int) -> Dict[str, Any]:
         """将 [B, ...] 的 batch 沿 batch 维复制 group_size 份，变成 [B*group_size, ...]。
         
         复制顺序为 scene-major（repeat_interleave），即：
