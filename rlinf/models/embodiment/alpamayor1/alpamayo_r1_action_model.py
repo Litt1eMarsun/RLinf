@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from transformers.generation.logits_process import LogitsProcessorList
 
 from .alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
+from .alpamayo_r1.models.base_model import ReasoningVLA
 from .helper import ConditionalTrajLogitsProcessor, create_message, get_processor
 
 logger = logging.getLogger(__name__)
@@ -42,15 +43,20 @@ class AlpamayoR1ForRL(AlpamayoR1):
     """
     
     def __init__(self, config, pretrained_modules=None, original_vocab_size=None):
-        super().__init__(config, pretrained_modules, original_vocab_size)
-        
+        # Bypass AlpamayoR1.__init__ to avoid instantiating action expert components
+        # (self.expert, self.action_space, self.diffusion, self.action_in_proj,
+        #  self.action_out_proj) that are only used for diffusion-based inference
+        # and are not needed in RL token-decode mode.
+        ReasoningVLA.__init__(self, config, pretrained_modules, original_vocab_size)
+        self.post_init()
+
         # Initialize processor
         self.processor = get_processor(self.tokenizer)
-        
+
         # Get trajectory token IDs for filtering
         self.traj_future_start_id = self.tokenizer.convert_tokens_to_ids("<|traj_future_start|>")
         self.traj_future_end_id = self.tokenizer.convert_tokens_to_ids("<|traj_future_end|>")
-        
+
         logger.info(f"AlpamayoR1ForRL initialized with traj tokens: start={self.traj_future_start_id}, end={self.traj_future_end_id}")
     
     @property
