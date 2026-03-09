@@ -106,7 +106,7 @@ def calculate_adv_and_returns(**kwargs) -> tuple[torch.Tensor, Optional[torch.Te
     if task_type in ["embodied", "av"]:
         # AV tasks use the same data format as embodied tasks (Trajectory-based)
         kwargs = preprocess_embodied_advantages_inputs(**kwargs)
-        if adv_type != "gae":
+        if adv_type not in ("gae", "grpo_per_step", "grpo_per_step_weighted"):
             kwargs = calculate_scores(**kwargs)
         advantages, returns = fn(**kwargs)
         res = postprocess_embodied_advantages_outputs(

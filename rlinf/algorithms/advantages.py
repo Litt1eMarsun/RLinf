@@ -133,6 +133,59 @@ def compute_grpo_advantages(
     return advantages, None
 
 
+@register_advantage("grpo_per_step_weighted")
+def compute_grpo_per_step_weighted_advantages(
+    rewards: torch.Tensor,
+    group_size: int = 1,
+    time_weight_type: str = "linear",
+    time_weight_gamma: float = 0.5,
+    **kwargs,
+):
+    """
+    Per-step GRPO advantages with temporal weighting.
+
+    First normalizes each timestep's reward independently within the group
+    (identical to grpo_per_step), then multiplies by a monotonically
+    increasing weight so that later timesteps receive stronger gradient signal.
+
+    Args:
+        rewards (torch.Tensor): Per-step rewards. Shape: [n_steps, bsz].
+        group_size (int): Number of rollouts per scene.
+        time_weight_type (str): Weighting scheme: "linear", "exponential", or "square".
+        time_weight_gamma (float): Base for exponential weighting (only used when
+            time_weight_type == "exponential").
+
+    Returns:
+        Tuple[torch.Tensor, None]: (advantages [n_steps, bsz], None)
+    """
+    n_steps, bsz = rewards.shape
+    num_groups = bsz // group_size
+
+    # Per-step GRPO normalization
+    grouped = rewards.reshape(n_steps, num_groups, group_size)
+    mean = grouped.mean(dim=-1, keepdim=True)
+    std = grouped.std(dim=-1, keepdim=True)
+    advantages = (grouped - mean) / (std + 1e-6)
+    advantages = advantages.reshape(n_steps, bsz)
+
+    # Temporal weighting: w_t increases with t
+    if time_weight_type == "exponential":
+        w = time_weight_gamma ** torch.arange(
+            n_steps - 1, -1, -1, device=rewards.device, dtype=rewards.dtype
+        )
+    elif time_weight_type == "square":
+        w = (
+            torch.arange(1, n_steps + 1, device=rewards.device, dtype=rewards.dtype)
+            / n_steps
+        ) ** 2
+    else:  # linear (default)
+        w = torch.linspace(1 / n_steps, 1.0, n_steps, device=rewards.device)
+
+    advantages = advantages * w.unsqueeze(1)
+
+    return advantages, None
+
+
 @register_advantage("reinpp")
 def compute_reinpp_advantages(
     rewards: torch.Tensor,

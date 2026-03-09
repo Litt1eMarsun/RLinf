@@ -261,7 +261,7 @@ class AVWorker(Worker):
                     mode="train",
                     **self._sampling_params
                 )
-                rewards = self._compute_rewards(result)
+                rewards, selected_idx = self._compute_rewards(result)
                 chunk_results.append(result)
                 chunk_rewards.append(rewards)
 
@@ -293,6 +293,7 @@ class AVWorker(Worker):
             merged_result,
             merged_rewards,
             batch_size=total_samples,
+            selected_idx=selected_idx,
         )
         
         # Send trajectory to output channel
@@ -341,26 +342,27 @@ class AVWorker(Worker):
                 moved_batch[key] = value
         return moved_batch
     
-    def _compute_rewards(self, result: Dict[str, Any], selected_idx: list = None) -> torch.Tensor:
+    def _compute_rewards(self, result: Dict[str, Any], selected_idx: list = None):
         """
-        Compute rewards based on trajectory prediction accuracy.
-        Uses minimum Average Displacement Error (minADE).
+        Compute per-waypoint rewards based on trajectory prediction accuracy.
         
         Args:
             result: Model prediction result containing:
                 - pred_xyz: [B, T_fut, 3]
                 - gt_xyz: [B, 1, T_fut, 3]
-            selected_idx:[B, T_sel_future] choosen point for reward
+            selected_idx: Waypoint indices to evaluate. If None, uses equal-spaced points.
         
         Returns:
-            rewards: [B] tensor of rewards
+            rewards: [B, n_waypoints] tensor of per-waypoint rewards
+            selected_idx: list of selected waypoint indices
         """
         pred_xyz = result["pred_xyz"]  # [B, T_fut, 3]
         gt_xyz = result["gt_xyz"]  # [B, 1, T_fut, 3]
         
         if gt_xyz is None:
             logger.warning("No ground truth available, returning zero rewards")
-            return torch.zeros(pred_xyz.shape[0], device=pred_xyz.device)
+            n_wp = len(selected_idx) if selected_idx else 4
+            raise RuntimeError
         
         gt_xyz = gt_xyz[:, 0, :, :]  # [B, T_fut, 3]
         
@@ -372,24 +374,20 @@ class AVWorker(Worker):
         pred_xyz_select = pred_xyz[:, selected_idx, :]
         gt_xyz_select = gt_xyz[:, selected_idx, :]
 
-        # Compute ADE (Average Displacement Error)
-        # ADE = mean of L2 distances across time steps
-        displacement = torch.norm(pred_xyz_select - gt_xyz_select, dim=-1)  # [B, T_fut]
-        ade = displacement.mean(dim=-1)  # [B]
+        displacement = torch.norm(pred_xyz_select - gt_xyz_select, dim=-1)  # [B, n_waypoints]
+        rewards = -displacement  # [B, n_waypoints]
+
+        reward_type = self._cfg.algorithm.get("reward_type", "sequence_level")
+        if reward_type != "waypoint_level":
+            rewards = rewards.mean(dim=-1, keepdim=True)  # [B, 1]
+            selected_idx = None
         
-        # Convert to reward (negative error)
-        # We use negative ADE as reward (higher is better)
-        # Linear reward is robust when ADE is large (early training), avoids numerical underflow.
-        # exp(-ade/threshold) collapses to 0 when ADE >> threshold.
-        rewards = -ade
-        
-        std_str = f"{rewards.std(correction=0).item():.4f}" if rewards.numel() > 1 else "N/A"
-        logger.info(f"Computed rewards - mean: {rewards.mean().item():.4f}, "
-                   f"std: {std_str}, "
+        logger.info(f"Computed rewards (reward_type={reward_type}) - mean: {rewards.mean().item():.4f}, "
+                   f"std: {rewards.std(correction=0).item():.4f}, "
                    f"min: {rewards.min().item():.4f}, "
                    f"max: {rewards.max().item():.4f}")
         
-        return rewards
+        return rewards, selected_idx
     
     def _prepare_trajectory(
         self,
@@ -397,6 +395,7 @@ class AVWorker(Worker):
         result: Dict[str, Any],
         rewards: torch.Tensor,
         batch_size: int = None,
+        selected_idx: list = None,
     ):
         """
         Prepare Trajectory object for actor training.
@@ -404,8 +403,9 @@ class AVWorker(Worker):
         Args:
             rollout_request: Original request
             result: Model prediction result
-            rewards: Computed rewards
-            batch_size: Total number of sequences (scenes * group_size). If None, inferred from rewards.
+            rewards: Computed rewards [B, n_waypoints]
+            batch_size: Total number of sequences (scenes * group_size).
+            selected_idx: List of waypoint indices used for reward computation.
         
         Returns:
             Trajectory object
@@ -415,40 +415,43 @@ class AVWorker(Worker):
         if batch_size is None:
             batch_size = len(rollout_request.multi_modal_inputs)
         
-        # Extract data from result
-        prev_logprobs = result.get("prev_logprobs")  # [B, num_tokens]
-        pred_xyz = result.get("pred_xyz")  # [B, T_fut, 3] - predicted trajectories
+        prev_logprobs = result.get("prev_logprobs")  # [B, tokens_per_traj]
+        pred_xyz = result.get("pred_xyz")  # [B, T_fut, 3]
         forward_inputs = result.get("forward_inputs")
-        # Create Trajectory object
-        # Note: Trajectory expects [T, B, ...] format for all tensor fields
-        # pred_xyz is [B, T_fut, 3], we need to reshape it to [1, B, T_fut*3]
-        # to match the single-step embodied format
+
+        # Store selected_idx as a Python list in forward_inputs for pipeline transfer
+        if selected_idx is not None:
+            forward_inputs["selected_idx"] = selected_idx
         
-        # Flatten trajectory: [B, T_fut, 3] -> [B, T_fut*3]
         actions_flat = pred_xyz.reshape(batch_size, -1)  # [B, T_fut*3]
-        actions = actions_flat.unsqueeze(0)  # [1, B, T_fut*3] - single timestep
+        actions = actions_flat.unsqueeze(0)  # [1, B, T_fut*3]
         
-        # Embodied RL framework expects dones/terminations/truncations to have
-        # num_chunk + 1 time steps (T+1), while rewards/actions have num_chunk (T).
-        # For single-step AV prediction: num_chunk=1, so dones needs [2, B, 1].
-        # First row = initial state (not done), second row = after prediction (done).
-        dones_tensor = torch.zeros(2, batch_size, 1, dtype=torch.bool)
-        dones_tensor[1] = True  # Episode ends after the single prediction step
-        terminations_tensor = torch.zeros(2, batch_size, 1, dtype=torch.bool)
-        truncations_tensor = torch.zeros(2, batch_size, 1, dtype=torch.bool)
+        # chunk_size = n_waypoints (rewards shape: [B, n_wp])
+        n_wp = rewards.shape[-1] if rewards.dim() > 1 else 1
+        
+        # dones/terminations/truncations: [num_chunk+1, B, chunk_size] = [2, B, n_wp]
+        # After preprocess flattening, dones become [n_steps+1, B].
+        # Only the LAST waypoint marks episode end; intermediate waypoints are NOT done.
+        # dones[0,:,:] = False (initial state before all waypoints)
+        # dones[1,:,:-1] = False (intermediate waypoints continue)
+        # dones[1,:,-1] = True (episode ends after last waypoint)
+        dones_tensor = torch.zeros(2, batch_size, n_wp, dtype=torch.bool)
+        dones_tensor[1, :, -1] = True
+        terminations_tensor = torch.zeros(2, batch_size, n_wp, dtype=torch.bool)
+        truncations_tensor = torch.zeros(2, batch_size, n_wp, dtype=torch.bool)
         
         trajectory = Trajectory(
             model_weights_id=f"{self.model_weights_id}",
-            actions=actions,  # [1, B, T_fut*3] - flattened trajectory
-            rewards=rewards.unsqueeze(0).unsqueeze(-1),  # [1, B, 1] - [num_chunk, bsz, chunk_size]
-            prev_logprobs=prev_logprobs.unsqueeze(0) if prev_logprobs is not None else None,  # [1, B, num_tokens]
-            prev_values=None,  # No critic for GRPO
-            dones=dones_tensor,  # [2, B, 1] - [num_chunk+1, bsz, chunk_size]
-            terminations=terminations_tensor,  # [2, B, 1]
-            truncations=truncations_tensor,  # [2, B, 1]
-            intervene_flags=torch.zeros(1, batch_size, 1, dtype=torch.bool),  # [1, B, 1]
-            forward_inputs=forward_inputs,  # Only simple tensors
-            max_episode_length=1,  # Single-step prediction
+            actions=actions,  # [1, B, T_fut*3]
+            rewards=rewards.unsqueeze(0),  # [1, B, n_wp] - [num_chunk, bsz, chunk_size]
+            prev_logprobs=prev_logprobs.unsqueeze(0) if prev_logprobs is not None else None,  # [1, B, tokens_per_traj]
+            prev_values=None,
+            dones=dones_tensor,  # [2, B, n_wp]
+            terminations=terminations_tensor,
+            truncations=truncations_tensor,
+            intervene_flags=torch.zeros(1, batch_size, n_wp, dtype=torch.bool),
+            forward_inputs=forward_inputs,
+            max_episode_length=1,
         )
         
         return trajectory

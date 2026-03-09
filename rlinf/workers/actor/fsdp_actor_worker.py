@@ -1357,6 +1357,8 @@ class AVFSDPActor(FSDPModelManager, Worker):
             "reward_type": self.cfg.algorithm.reward_type,
             "loss_mask": self.rollout_batch.get("loss_mask", None),
             "loss_mask_sum": self.rollout_batch.get("loss_mask_sum", None),
+            "time_weight_type": self.cfg.algorithm.get("time_weight_type", "linear"),
+            "time_weight_gamma": self.cfg.algorithm.get("time_weight_gamma", 0.5),
         }
 
         advantages_and_returns = calculate_adv_and_returns(**kwargs)
@@ -1368,7 +1370,6 @@ class AVFSDPActor(FSDPModelManager, Worker):
             self.rollout_batch.update({"loss_mask_sum": kwargs["loss_mask_sum"]})
 
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
-        # import ipdb; ipdb.set_trace() # 在这里查看rollout_batch的key及其对应的value是否全（tokenize_input缺这个key
         return rollout_metrics
 
     def run_training(self) -> None:
@@ -1509,14 +1510,29 @@ class AVFSDPActor(FSDPModelManager, Worker):
                     ):
                         prev_logprobs = output_dict["prev_logprobs"]
 
-                    # For AV tasks, use a large default max_episode_steps since we don't have env config
+                    # For waypoint_level rewards, extract only the logprob tokens
+                    # corresponding to selected waypoints before loss computation.
+                    # Each waypoint i maps to action tokens [i*action_dim, ..., (i+1)*action_dim-1].
+                    action_dim = self.cfg.actor.model.get("action_dim", 2)
+                    if self.cfg.algorithm.reward_type == "waypoint_level":
+                        sel_idx = forward_inputs.get("selected_idx") if forward_inputs else None
+                        if isinstance(sel_idx, list) and sel_idx and isinstance(sel_idx[0], list):
+                            sel_idx = sel_idx[0]
+                        if sel_idx is not None:
+                            tok_idx = []
+                            for wi in sel_idx:
+                                tok_idx.extend(range(wi * action_dim, (wi + 1) * action_dim))
+                            tok_idx = torch.tensor(tok_idx, device=output_dict["logprobs"].device)
+                            output_dict["logprobs"] = output_dict["logprobs"][:, tok_idx]
+                            prev_logprobs = prev_logprobs[:, tok_idx]
+
                     max_episode_steps = self.cfg.get("env", {}).get("train", {}).get("max_episode_steps", 1000)
-                    
+
                     kwargs = {
                         "loss_type": self.cfg.algorithm.loss_type,
                         "logprob_type": self.cfg.algorithm.logprob_type,
                         "reward_type": self.cfg.algorithm.reward_type,
-                        "single_action_dim": self.cfg.actor.model.get("action_dim", 7),
+                        "single_action_dim": action_dim,
                         "logprobs": output_dict["logprobs"],
                         "values": output_dict.get("values", None),
                         "old_logprobs": prev_logprobs,
