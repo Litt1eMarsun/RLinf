@@ -172,11 +172,27 @@ class AlpamayoR1ForRL(AlpamayoR1):
         # So logits[:, prompt_length-1:-1] predicts tokens at [prompt_length:]
         traj_token_logits = logits[:, prompt_length-1:-1, :]  # [B, gen_length, vocab_size]
         
-        # Compute log probabilities
-        log_probs = F.log_softmax(traj_token_logits, dim=-1)
-        
         # Get generated token IDs (after prompt)
         generated_tokens = generated_sequences[:, prompt_length:]  # [B, gen_length]
+
+        # Reuse ConditionalTrajLogitsProcessor to apply the same vocabulary mask
+        # as during rollout, ensuring log_softmax normalises over the same token set.
+        action_space_dims = self.traj_tokenizer.action_space.get_action_space_dims()
+        tokens_per_traj = 1
+        for d in action_space_dims:
+            tokens_per_traj *= d
+        processor = ConditionalTrajLogitsProcessor(
+            traj_start_id=self.traj_future_start_id,
+            traj_end_id=self.traj_future_end_id,
+            traj_token_offset=self.future_token_start_idx,
+            traj_vocab_size=self.traj_tokenizer.vocab_size,
+            tokens_per_traj=tokens_per_traj,
+        )
+        gen_length = traj_token_logits.shape[1]
+        for t in range(gen_length):
+            processor(generated_sequences[:, :prompt_length + t], traj_token_logits[:, t, :])
+
+        log_probs = F.log_softmax(traj_token_logits, dim=-1)
         
         # Filter to trajectory tokens only (between start and end markers)
         logprobs_list = []
@@ -515,7 +531,10 @@ class AlpamayoR1ForRL(AlpamayoR1):
         device = generated_tokens.device
         
         # Stack logits: list of [B, vocab_size] -> [B, gen_length, vocab_size]
-        logits_stacked = torch.stack(logits, dim=1)  # [B, gen_length, vocab_size]
+        # HF generate() converts logits to float32 internally (_sample L2800).
+        # Cast back to bfloat16 so log_softmax precision matches the FSDP bf16
+        # forward path, keeping the policy ratio consistent (~1.0 for on-policy).
+        logits_stacked = torch.stack(logits, dim=1).to(dtype=torch.bfloat16)
         
         # Compute log probabilities
         log_probs = F.log_softmax(logits_stacked, dim=-1)  # [B, gen_length, vocab_size]
