@@ -224,12 +224,9 @@ class AVWorker(Worker):
         group_size = self._cfg.algorithm.group_size
         device = self._model.vlm.device
 
-        # Collate 原始 batch: [B, ...]
+        # Collate on CPU first, then expand (still on CPU), to avoid
+        # holding group_size copies of the image tensor on GPU simultaneously.
         batch = self._collate_batch(batch_data_list)
-        batch = self._move_to_device(batch, device)
-
-        # 将 batch 沿 batch 维复制 group_size 份: [B*group_size, ...]
-        # scene-major 顺序: [s0_g0, s0_g1, ..., s0_gG-1, s1_g0, ...]
         expanded_batch = self._expand_batch_for_group(batch, group_size)
         total_samples = B * group_size
         logger.info(f"Batch expanded: {B} scenes × {group_size} groups = {total_samples} samples")
@@ -246,15 +243,14 @@ class AVWorker(Worker):
                 start = chunk_idx * rollout_micro_batch_size
                 end = min(start + rollout_micro_batch_size, total_samples)
                 
-                # 切出当前 micro batch
-                micro_batch = {}
+                # Slice on CPU first, then move to GPU to keep peak GPU memory low.
+                micro_batch_cpu = {}
                 for key, value in expanded_batch.items():
-                    if isinstance(value, torch.Tensor):
-                        micro_batch[key] = value[start:end]
-                    elif isinstance(value, list):
-                        micro_batch[key] = value[start:end]
+                    if isinstance(value, (torch.Tensor, list)):
+                        micro_batch_cpu[key] = value[start:end]
                     else:
-                        micro_batch[key] = value
+                        micro_batch_cpu[key] = value
+                micro_batch = self._move_to_device(micro_batch_cpu, device)
 
                 actions, result = self._model.predict_action_batch(
                     micro_batch,
